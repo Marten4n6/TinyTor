@@ -12,8 +12,14 @@
   <a href="https://github.com/Marten4n6/TinyTor/blob/master/LICENSE.txt">
       <img src="https://img.shields.io/badge/license-GPLv3-blue.svg?style=flat-square" alt="License">
   </a>
+  <a href="https://www.python.org/">
+      <img src="https://img.shields.io/badge/python-2.7,%203.7-blue.svg?style=flat-square" alt="Python">
+  </a>
   <a href="https://github.com/Marten4n6/TinyTor/issues">
     <img src="https://img.shields.io/github/issues/Marten4n6/TinyTor.svg?style=flat-square" alt="Issues">
+  </a>
+  <a href="https://travis-ci.org/Marten4n6/TinyTor">
+      <img src="https://img.shields.io/travis/Marten4n6/TinyTor/master.svg?style=flat-square" alt="Build Status">
   </a>
   <a href="https://github.com/Marten4n6/TinyTor">
       <img src="https://img.shields.io/badge/contributions-welcome-brightgreen.svg?style=flat-square" alt="Contributing">
@@ -57,7 +63,8 @@ It's goal is to run **natively** on Linux/macOS and live in a single file.
 ## Technical details
 
 TinyTor uses the system's OpenSSL for encryption. <br/>
-The implementation uses NTOR, which is newer type of handshake and uses curve25519 (see tor-spec.txt 4.4.2, 5.1.4).
+The implementation uses NTOR, which is newer type of handshake and uses curve25519 (see tor-spec.txt 4.4.2, 5.1.4). <br/>
+(Link protocol version 2 or higher is supported.)
 
 | Name                  | Description                                                             |
 | --------------------- | ----------------------------------------------------------------------- |
