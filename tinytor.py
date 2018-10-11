@@ -14,6 +14,7 @@ import urllib.request
 from argparse import ArgumentParser
 from base64 import b64decode, b16encode
 from sys import exit
+from time import time
 
 BANNER = """\
   _____  _               _____            
@@ -25,7 +26,7 @@ BANNER = """\
 """ % (__author__, __version__)
 
 # Logging
-logging.basicConfig(format="[%(levelname)s] %(filename)s - %(message)s", level=logging.DEBUG)
+logging.basicConfig(format="[%(levelname)s] %(filename)s - %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
 
@@ -289,7 +290,6 @@ class Cell:
         :param command: The type of command this cell is.
         :type command: int
         :param payload: This is the actual request/response data.
-        :type payload: list
         """
         self.circuit_id = circuit_id
         self.command = command
@@ -305,43 +305,22 @@ class Cell:
         return struct.pack("!HBH", self.circuit_id, self.command, len(payload_bytes)) + payload_bytes
 
     @staticmethod
-    def parse_response(raw_response):
-        """Parses a response into it's Cell objects.
-
-        :type raw_response: bytes
-        :rtype: list[Cell]
+    def is_variable_length_command(command):
         """
-        cells = []
+        On a version 2 connection, variable-length cells are indicated by a
+        command byte equal to 7 ("VERSIONS").  On a version 3 or
+        higher connection, variable-length cells are indicated by a command
+        byte equal to 7 ("VERSIONS"), or greater than or equal to 128.
 
-        while raw_response:
-            try:
-                # https://docs.python.org/3/library/struct.html
-                circuit_id, command_type, payload_length = struct.unpack("!HBH", raw_response[:5])
-                payload = raw_response[5:5 + payload_length]
+        See tor-spec.txt 3. "Cell Packet format"
 
-                # Parse each (cell response) payload into it's Cell object here...
-                if command_type == CommandType.VERSIONS:
-                    versions = []
-
-                    while payload:
-                        versions.append(struct.unpack("!H", payload[:2])[0])
-                        payload = payload[2:]
-
-                    cells.append(Cell(circuit_id, CommandType.VERSIONS, versions))
-                else:
-                    log.debug("--- START UNKNOWN CELL ---")
-                    log.debug("Circuit ID: " + str(circuit_id))
-                    log.debug("Command type: " + str(command_type))
-                    log.debug("Payload length: " + str(payload_length))
-                    log.debug("Payload: " + str(payload))
-                    log.debug("--- END UNKNOWN CELL ---")
-                    cells.append(Cell(circuit_id, command_type, payload))
-
-            except struct.error:
-                break
-            raw_response = raw_response[5 + payload_length:]
-
-        return cells
+        :type command: int
+        :rtype: bool
+        """
+        if command == CommandType.VERSIONS or command >= 128:
+            return True
+        else:
+            return False
 
 
 class TorSocket:
@@ -350,14 +329,34 @@ class TorSocket:
     def __init__(self, guard_relay):
         """:type guard_relay: OnionRouter"""
         self._guard_relay = guard_relay
+
+        # All implementations MUST support the SSLv3 cipher suite
+        # "TLS_DHE_RSA_WITH_AES_128_CBC_SHA" if it is available.
         self._socket = ssl.wrap_socket(
             socket.socket(socket.AF_INET, socket.SOCK_STREAM),
             ssl_version=ssl.PROTOCOL_SSLv23
         )
 
+        self._protocol_versions = None
+
         self._connect()
+
+        # When the in-protocol handshake is used, the initiator sends a
+        # VERSIONS cell to indicate that it will not be renegotiating.  The
+        # responder sends a VERSIONS cell, a CERTS cell (4.2 below) to give the
+        # initiator the certificates it needs to learn the responder's
+        # identity, an AUTH_CHALLENGE cell (4.3) that the initiator must include
+        # as part of its answer if it chooses to authenticate, and a NETINFO
+        # cell (4.5).  As soon as it gets the CERTS cell, the initiator knows
+        # whether the responder is correctly authenticated.  At this point the
+        # initiator behaves differently depending on whether it wants to
+        # authenticate or not. If it does not want to authenticate, it MUST
+        # send a NETINFO cell.
         self._send_versions()
         self._retrieve_versions()
+        self._retrieve_certs()
+        self._retrieve_net_info()
+        self._send_net_info()
 
     def _connect(self):
         """Connects the socket to the guard relay."""
@@ -371,24 +370,120 @@ class TorSocket:
         """
         self._socket.write(cell.get_bytes())
 
-    def _retrieve_cells(self):
-        """Waits for a cell response.
+    def _retrieve_cell(self):
+        """Waits for a cell response then parses it into a Cell object.
 
-        :rtype: list[Cell]
+        :rtype: Cell
         """
-        raw_response = self._socket.read(Cell.CELL_SIZE)
-        
-        return Cell.parse_response(raw_response)
+        # https://docs.python.org/3/library/struct.html
+
+        # Get the cell's circuit ID.
+        # Link protocol 4 increases circuit ID width to 4 bytes.
+        if self._protocol_versions and self._protocol_versions[len(self._protocol_versions) - 1] >= 4:
+            circuit_id = struct.unpack("!i", self._socket.read(4))[0]
+        else:
+            circuit_id = struct.unpack("!H", self._socket.read(2))[0]
+
+        # Get the cell's command.
+        command = struct.unpack("!B", self._socket.read(1))[0]
+
+        # Get the cell's payload.
+        # Variable length cells have the following format:
+        #
+        #    CircID                             [CIRCID_LEN octets]
+        #    Command                            [1 octet]
+        #    Length                             [2 octets; big-endian integer]
+        #    Payload (some commands MAY pad)    [Length bytes]
+        #
+        # Fixed-length cells have the following format:
+        #
+        #    CircID                              [CIRCID_LEN bytes]
+        #    Command                             [1 byte]
+        #    Payload (padded with padding bytes) [PAYLOAD_LEN bytes]
+        if Cell.is_variable_length_command(command):
+            payload_length = struct.unpack("!H", self._socket.read(2))[0]
+            payload = self._socket.read(payload_length)
+        else:
+            payload = self._socket.read(Cell.MAX_PAYLOAD_SIZE)
+
+        # Parse into a cell object here...
+        if command == CommandType.VERSIONS:
+            versions = []
+
+            # The payload in a VERSIONS cell is a series of big-endian two-byte integers.
+            while payload:
+                versions.append(struct.unpack("!H", payload[:2])[0])
+                payload = payload[2:]
+
+            return Cell(circuit_id, command, versions)
+        else:
+            log.debug("===== START UNKNOWN CELL =====")
+            log.debug("Circuit ID: " + str(circuit_id))
+            log.debug("Command type: " + str(command))
+            log.debug("Payload: " + str(payload))
+            log.debug("===== END UNKNOWN CELL   =====")
+            return Cell(circuit_id, command, payload)
 
     def _send_versions(self):
         log.debug("Sending VERSIONS cell...")
 
-        self._socket.write(Cell(0, CommandType.VERSIONS, [3]).get_bytes())
+        self._socket.write(Cell(0, CommandType.VERSIONS, [3, 4, 5]).get_bytes())
 
     def _retrieve_versions(self):
-        versions_cell = self._retrieve_cells()[0]
+        log.debug("Retrieving VERSIONS cell...")
+        versions_cell = self._retrieve_cell()
 
-        log.debug("Supported link protocol versions: %s" % str(versions_cell.payload))
+        # When the "renegotiation" handshake is used, implementations
+        # MUST list only the version 2.  When the "in-protocol" handshake is
+        # used, implementations MUST NOT list any version before 3, and SHOULD
+        # list at least version 3.
+        log.debug("Supported link protocol versions: %s" % versions_cell.payload)
+        self._protocol_versions = versions_cell.payload
+
+    def _retrieve_certs(self):
+        log.debug("Retrieving CERTS cell...")
+        certs_cell = self._retrieve_cell()
+
+        log.debug("Retrieving AUTH_CHALLENGE cell...")
+        auth_cell = self._retrieve_cell()
+
+    def _retrieve_net_info(self):
+        log.debug("Retrieving NET_INFO cell...")
+        net_info_cell = self._retrieve_cell()
+
+    def _send_net_info(self):
+        log.debug("Sending NET_INFO cell...")
+
+        # If version 2 or higher is negotiated, each party sends the other a
+        # NETINFO cell.  The cell's payload is:
+        #
+        #    Timestamp              [4 bytes]
+        #    Other OR's address     [variable]
+        #    Number of addresses    [1 byte]
+        #    This OR's addresses    [variable]
+        #
+        # The address format is a type/length/value sequence as given in
+        # section 6.4 below, without the final TTL.
+        #
+        # Address format:
+        #    Type   (1 octet)
+        #    Length (1 octet)
+        #    Value  (variable-width)
+        # "Length" is the length of the Value field.
+        # "Type" is one of:
+        #    0x00 -- Hostname
+        #    0x04 -- IPv4 address
+        #    0x06 -- IPv6 address
+        #    0xF0 -- Error, transient
+        #    0xF1 -- Error, nontransient
+        self._socket.write(Cell(
+            0, CommandType.NETINFO, [
+                time(),
+                0x04, 0x04, self._guard_relay.ip,
+                0x01,
+                0x04, 0x04, 0
+            ]
+        ).get_bytes())
 
 
 class TinyTor:
@@ -422,7 +517,7 @@ class TinyTor:
         guard_relay = self._consensus.get_guard_relay()
 
         log.debug("Using guard relay \"%s\"..." % guard_relay.nickname)
-        log.info("Attempting to send HTTP request to: %s" % url)
+        log.debug("Descriptor URL: %s" % guard_relay.get_descriptor_url())
 
         # Start communicating with the guard relay.
         tor_socket = TorSocket(guard_relay)
@@ -432,6 +527,7 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("--host", help="the onion service to reach", required=True)
     parser.add_argument("--no-banner", help="prevent the TinyTor banner from being displayed", action="store_true")
+    parser.add_argument("-v", "--verbose", help="enable verbose output", action="store_true")
 
     arguments = parser.parse_args()
 
@@ -440,6 +536,8 @@ def main():
     if not arguments.host.endswith(".onion"):
         log.error("Invalid onion service specified.")
         exit(1)
+    if arguments.verbose:
+        log.setLevel(logging.DEBUG)
 
     tinytor = TinyTor()
     tinytor.http_get("example.onion")
