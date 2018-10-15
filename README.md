@@ -33,6 +33,8 @@
 TinyTor can be used to communicate with [onion services](https://www.torproject.org/docs/onion-services.html) via [Tor](https://www.torproject.org/about/overview#thesolution). <br/>
 Furthermore, it may be used by developers as a simple library. <br/>
 
+**If you're reading this, this implementation is NOT FINISHED yet.**
+
 ## How To Use
 
 ```bash
@@ -58,13 +60,12 @@ print(tor.http_get("example.onion"))
 ## Motivation
 
 TinyTor was created to communicate anonymously in [EvilOSX](https://github.com/Marten4n6/EvilOSX). <br/>
-It's goal is to run **natively** on Linux/macOS and live in a single file.
+It's goal is to run **natively** on Linux/macOS, live in a single file and be as small as possible.
 
 ## Technical details
 
 TinyTor uses the system's OpenSSL for encryption. <br/>
-The implementation uses NTOR, which is newer type of handshake and uses curve25519 (see tor-spec.txt 4.4.2, 5.1.4). <br/>
-(Link protocol version 2 or higher is supported.)
+Because macOS uses [LibreSSL](https://www.libressl.org/) which doesn't currently support curve25519, the TAP handshake is used (instead of NTOR).
 
 | Name                  | Description                                                             |
 | --------------------- | ----------------------------------------------------------------------- |
@@ -73,7 +74,7 @@ The implementation uses NTOR, which is newer type of handshake and uses curve255
 | Exit relay            | Sends traffic to the final destination intended by the client.          |
 | Directory authority   | A trusted server where information about the Tor network is stored.     |
 | Consensus             | A document where all Tor relays is maintained.                          |
-| Descriptor            | Contains the public key and other information about a relay.            |
+| Descriptor            | Contains the public keys and other information about a relay.           |
 | Cell                  | A command request/response used when communicating with onion routers.  |
 | Circuit               | A path through the network connecting a client to its destination.      |
 
