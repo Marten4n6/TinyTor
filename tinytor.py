@@ -10,9 +10,11 @@ import random
 import socket
 import ssl
 import struct
+import subprocess
 import urllib.request
 from argparse import ArgumentParser
-from base64 import b64decode, b16encode
+from base64 import b64encode, b64decode, b16encode
+from os import urandom
 from sys import exit
 from time import time
 
@@ -52,7 +54,7 @@ class DirectoryAuthority:
 class OnionRouter:
     """This class represents an onion router in a circuit.."""
 
-    def __init__(self, nickname, ip, dir_port, tor_port, fingerprint, flags=None, ntor_key=None):
+    def __init__(self, nickname, ip, dir_port, tor_port, fingerprint, flags=None, key_tap=None):
         """
         :type nickname: str
         :type ip: str
@@ -60,7 +62,7 @@ class OnionRouter:
         :type tor_port: int
         :type fingerprint: str
         :type flags: list
-        :type ntor_key: str
+        :type key_tap: bytes
         """
         self.nickname = nickname
         self.ip = ip
@@ -68,19 +70,55 @@ class OnionRouter:
         self.tor_port = tor_port
         self.fingerprint = fingerprint
         self.flags = flags
-        self.ntor_key = ntor_key
+        self.key_tap = key_tap
 
     def get_descriptor_url(self):
         """:return: The URL to the onion router's descriptor (where keys are stored)."""
         return "http://%s:%s/tor/server/fp/%s" % (self.ip, self.dir_port, self.fingerprint)
 
     def parse_descriptor(self):
-        # TODO - Parse the descriptor and update the key(s).
-        pass
+        """Updates the onion router's keys."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 6.1; rv:60.0) Gecko/20100101 Firefox/60.0"
+        }
+        request = urllib.request.Request(url=self.get_descriptor_url(), headers=headers)
+        response = urllib.request.urlopen(request)
+
+        key_tap = ""
+        append_tap = False
+
+        for line in response:
+            line = line.decode()
+
+            if line.startswith("onion-key"):
+                append_tap = True
+                continue
+
+            if append_tap:
+                if "END RSA PUBLIC KEY" in line:
+                    key_tap += line.replace("\n", "")
+                    break
+                else:
+                    key_tap += line
+
+        # IMPORTANT:
+        # The openssl rsa command only works with PKCS#8 formatted public keys.
+        # "BEGIN RSA PUBLIC KEY" is PKCS#1, which can only contain RSA keys.
+        # "BEGIN PUBLIC KEY" is PKCS#8, which can contain a variety of formats.
+
+        # macOS / OSX doesn't support "-RSAPublicKey_in" (https://stackoverflow.com/a/27930720)
+        # So fuck it, we'll do it manually then.
+        # https://tls.mbed.org/kb/cryptography/asn1-key-structures-in-der-and-pem
+        # https://www.openssl.org/docs/man1.0.2/apps/asn1parse.html
+        # https://stackoverflow.com/a/29707204
+        # TODO -
+        log.debug("Converting guard public key to DER format...")
+
+        self.key_tap = key_tap
 
     def __str__(self):
-        return "OnionRouter(nickname=%s, ip=%s, dir_port=%s, tor_port=%s, fingerprint=%s, flags=%s, ntor_key=%s)" % (
-            self.nickname, self.ip, self.dir_port, self.tor_port, self.fingerprint, self.flags, self.ntor_key
+        return "OnionRouter(nickname=%s, ip=%s, dir_port=%s, tor_port=%s, fingerprint=%s, flags=%s, key_tap=%s)" % (
+            self.nickname, self.ip, self.dir_port, self.tor_port, self.fingerprint, self.flags, self.key_tap
         )
 
 
@@ -150,7 +188,8 @@ class Consensus:
 
                 while True:
                     try:
-                        # The fingerprint is base64 encoded then encoded with base16.
+                        # The fingerprint here is base64 encoded bytes.
+                        # The descriptor URL uses the base16 encoded value of these bytes.
                         # Documentation for this was hard to find...
                         identity = b16encode(b64decode(identity.encode())).decode()
                         break
@@ -323,6 +362,183 @@ class Cell:
             return False
 
 
+class HybridEncryption:
+    """
+    Encryption used to calculate the payload of a CREATE cell ('onion skin').
+
+    See tor-spec.txt 0.4. "A bad hybrid encryption algorithm, for legacy purposes."
+    """
+
+    # tor-spec.txt 0.3. "Ciphers"
+    KEY_LEN = 16
+    PK_ENC_LEN = 128
+    PK_PAD_LEN = 42
+
+    PK_DATA_LEN = (PK_ENC_LEN - PK_PAD_LEN)
+    PK_DATA_LEN_WITH_KEY = (PK_DATA_LEN - KEY_LEN)
+
+    def encrypt(self, my_public_key, guard_public_key):
+        """Encrypts the data with the guard relay's TAP public key.
+
+        :type my_public_key: bytes
+        :type guard_public_key: guard_public_key_bytes
+        :rtype: bytes
+        """
+        # M = data
+
+        if len(my_public_key) < self.PK_DATA_LEN:
+            # 1. If the length of M is no more than PK_ENC_LEN-PK_PAD_LEN,
+            #    pad and encrypt M with PK.
+            #
+            # "Also note that as used in Tor's protocols, case 1 never occurs."
+            # So apparently this should never occur?
+            log.error("FAILED TO ENCRYPT USING HYBRID ENCRYPTION, THIS SHOULDN'T HAPPEN.")
+            log.error("Please submit an issue on GitHub!")
+            exit(1)
+        else:
+            # 2. Otherwise, generate a KEY_LEN byte random key K.
+            random_key_bytes = urandom(self.KEY_LEN)
+
+            # Let M1 = the first PK_ENC_LEN-PK_PAD_LEN-KEY_LEN bytes of M,
+            # and let M2 = the rest of M.
+            m1 = my_public_key[:self.PK_DATA_LEN_WITH_KEY]
+            m2 = my_public_key[self.PK_DATA_LEN_WITH_KEY:]
+
+            # Pad and encrypt K|M1 with PK.
+            # tor-spec.txt 0.3. "Ciphers":
+            # We use OAEP-MGF1 padding, with SHA-1 as its digest function.
+            k_and_m1 = random_key_bytes + m1
+
+            # Thanks https://superuser.com/a/431651
+            out, err = subprocess.Popen("(echo '%s' | base64 --decode; echo '%s' | base64 --decode) | "
+                                        "openssl rsautl -pubin -inform DER -inkey /dev/stdin -encrypt -in /dev/stdin"
+                                        % (b64encode(guard_public_key.encode()).decode(), b64encode(k_and_m1).decode()),
+                                        shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+            output = (out + err).decode()
+
+            # Encrypt M2 with our stream cipher, using the key K.
+
+            # Concatenate these encrypted values.
+            return "NOT_FINISHED"
+
+
+class KeyAgreementTAP:
+    """
+    This handshake uses Diffie-Hellman in Z_p and RSA to compute a set of
+    shared keys which the client knows are shared only with a particular
+    server, and the server knows are shared with whomever sent the
+    original handshake (or with nobody at all).  It's not very fast and
+    not very good.  (See Goldberg's "On the Security of the Tor
+    Authentication Protocol".)
+
+    The reason for using TAP instead of NTOR is that
+    macOS / OSX comes with LibreSSL (2.2.7) which doesn't support curve25519.
+    """
+
+    def __init__(self):
+        self._hybrid_encryption = HybridEncryption()
+        self._private_key = None
+        self._public_key = None
+
+        self._create_private_key()
+        self._create_public_key()
+
+    def _create_private_key(self):
+        """Generate a RSA private key."""
+        out, err = subprocess.Popen("openssl genrsa 1024", shell=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+        output = (out + err).decode()
+
+        private_key = ""
+        append_key = False
+
+        for line in output.splitlines(keepends=True):
+            if "BEGIN RSA PRIVATE KEY" in line:
+                private_key += line
+                append_key = True
+                continue
+
+            if append_key:
+                if "END RSA PRIVATE KEY" in line:
+                    private_key += line.replace("\n", "")
+                    break
+                else:
+                    private_key += line
+
+        self._private_key = private_key
+        log.debug("Created private key (for hybrid encryption)...")
+
+    def _create_public_key(self):
+        """:rtype: str"""
+        # Calculate (derive) the public key from the private key to DER (bytes) format.
+        out, err = subprocess.Popen("echo '%s' | openssl rsa -outform DER -pubout" % self._private_key,
+                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+        self._public_key = (out + err)
+
+    def get_public_key(self):
+        """:rtype: bytes"""
+        return self._public_key
+
+    def get_onion_skin(self, my_public_key, guard_tap_public_key):
+        """
+        The payload for a CREATE cell is an 'onion skin', which consists of
+        the first step of the DH handshake data (also known as g^x).  This
+        value is encrypted using the "legacy hybrid encryption" algorithm.
+
+        See tor-spec.txt 5.1.3. The "TAP" handshake
+
+        :type my_public_key: bytes
+        :type guard_tap_public_key: bytes
+        """
+        return self._hybrid_encryption.encrypt(my_public_key, guard_tap_public_key)
+
+
+class Circuit:
+    """Handles circuit management."""
+
+    def __init__(self, tor_socket):
+        """
+        :type tor_socket: TorSocket
+        """
+        self._tor_socket = tor_socket
+        self._handshake_tap = KeyAgreementTAP()
+
+    def build(self):
+        """Builds a path to the "exit" relay."""
+        log.debug("Building a circuit...")
+
+        self._send_create_cell()
+
+    def _send_create_cell(self):
+        """
+        Users set up circuits incrementally, one hop at a time. To create a
+        new circuit, OPs send a CREATE/CREATE2 cell to the first node, with
+        the first half of an authenticated handshake; that node responds with
+        a CREATED/CREATED2 cell with the second half of the handshake. To
+        extend a circuit past the first hop, the OP sends an EXTEND/EXTEND2
+        relay cell (see section 5.1.2) which instructs the last node in the
+        circuit to send a CREATE/CREATE2 cell to extend the circuit.
+
+        See tor-spec.txt 5.1. "CREATE and CREATED cells"
+        """
+        log.debug("Sending CREATE cell...")
+
+        # The format of a CREATE cell is one of the following:
+        #     HDATA     (Client Handshake Data)     [TAP_C_HANDSHAKE_LEN bytes]
+        # or
+        #     HTAG      (Client Handshake Type Tag) [16 bytes]
+        #     HDATA     (Client Handshake Data)     [TAP_C_HANDSHAKE_LEN-16 bytes]
+        self._tor_socket.send_cell(Cell(
+            0, CommandType.CREATE, [
+                "tap",
+                self._handshake_tap.get_onion_skin(
+                    self._handshake_tap.get_public_key(),
+                    self._tor_socket.get_guard_relay().key_tap
+                )
+            ]
+        ))
+
+
 class TorSocket:
     """Handles communicating with the guard relay."""
 
@@ -336,7 +552,6 @@ class TorSocket:
             socket.socket(socket.AF_INET, socket.SOCK_STREAM),
             ssl_version=ssl.PROTOCOL_SSLv23
         )
-
         self._protocol_versions = None
 
         self._connect()
@@ -358,36 +573,41 @@ class TorSocket:
         self._retrieve_net_info()
         self._send_net_info()
 
+        # Build a circuit.
+        self._circuit = Circuit(self)
+        self._circuit.build()
+
+    def get_guard_relay(self):
+        """:return: The guard relay this socket is attached to."""
+        return self._guard_relay
+
     def _connect(self):
         """Connects the socket to the guard relay."""
         log.debug("Connecting socket to the guard relay...")
         self._socket.connect((self._guard_relay.ip, self._guard_relay.tor_port))
 
-    def _send_cell(self, cell):
+    def send_cell(self, cell):
         """Sends a cell to the guard relay.
 
         :type cell: Cell
         """
         self._socket.write(cell.get_bytes())
 
-    def _retrieve_cell(self):
+    def retrieve_cell(self, ignore_response=False):
         """Waits for a cell response then parses it into a Cell object.
 
-        :rtype: Cell
+        :rtype: Cell or None
         """
         # https://docs.python.org/3/library/struct.html
 
-        # Get the cell's circuit ID.
         # Link protocol 4 increases circuit ID width to 4 bytes.
         if self._protocol_versions and self._protocol_versions[len(self._protocol_versions) - 1] >= 4:
             circuit_id = struct.unpack("!i", self._socket.read(4))[0]
         else:
             circuit_id = struct.unpack("!H", self._socket.read(2))[0]
 
-        # Get the cell's command.
         command = struct.unpack("!B", self._socket.read(1))[0]
 
-        # Get the cell's payload.
         # Variable length cells have the following format:
         #
         #    CircID                             [CIRCID_LEN octets]
@@ -407,22 +627,23 @@ class TorSocket:
             payload = self._socket.read(Cell.MAX_PAYLOAD_SIZE)
 
         # Parse into a cell object here...
-        if command == CommandType.VERSIONS:
-            versions = []
+        if not ignore_response:
+            if command == CommandType.VERSIONS:
+                versions = []
 
-            # The payload in a VERSIONS cell is a series of big-endian two-byte integers.
-            while payload:
-                versions.append(struct.unpack("!H", payload[:2])[0])
-                payload = payload[2:]
+                # The payload in a VERSIONS cell is a series of big-endian two-byte integers.
+                while payload:
+                    versions.append(struct.unpack("!H", payload[:2])[0])
+                    payload = payload[2:]
 
-            return Cell(circuit_id, command, versions)
-        else:
-            log.debug("===== START UNKNOWN CELL =====")
-            log.debug("Circuit ID: " + str(circuit_id))
-            log.debug("Command type: " + str(command))
-            log.debug("Payload: " + str(payload))
-            log.debug("===== END UNKNOWN CELL   =====")
-            return Cell(circuit_id, command, payload)
+                return Cell(circuit_id, command, versions)
+            else:
+                log.debug("===== START UNKNOWN CELL =====")
+                log.debug("Circuit ID: " + str(circuit_id))
+                log.debug("Command type: " + str(command))
+                log.debug("Payload: " + str(payload))
+                log.debug("===== END UNKNOWN CELL   =====")
+                return Cell(circuit_id, command, payload)
 
     def _send_versions(self):
         log.debug("Sending VERSIONS cell...")
@@ -431,25 +652,21 @@ class TorSocket:
 
     def _retrieve_versions(self):
         log.debug("Retrieving VERSIONS cell...")
-        versions_cell = self._retrieve_cell()
+        versions_cell = self.retrieve_cell()
 
-        # When the "renegotiation" handshake is used, implementations
-        # MUST list only the version 2.  When the "in-protocol" handshake is
-        # used, implementations MUST NOT list any version before 3, and SHOULD
-        # list at least version 3.
         log.debug("Supported link protocol versions: %s" % versions_cell.payload)
         self._protocol_versions = versions_cell.payload
 
     def _retrieve_certs(self):
         log.debug("Retrieving CERTS cell...")
-        certs_cell = self._retrieve_cell()
+        self.retrieve_cell(ignore_response=True)
 
         log.debug("Retrieving AUTH_CHALLENGE cell...")
-        auth_cell = self._retrieve_cell()
+        self.retrieve_cell(ignore_response=True)
 
     def _retrieve_net_info(self):
         log.debug("Retrieving NET_INFO cell...")
-        net_info_cell = self._retrieve_cell()
+        self.retrieve_cell(ignore_response=True)
 
     def _send_net_info(self):
         log.debug("Sending NET_INFO cell...")
@@ -462,9 +679,6 @@ class TorSocket:
         #    Number of addresses    [1 byte]
         #    This OR's addresses    [variable]
         #
-        # The address format is a type/length/value sequence as given in
-        # section 6.4 below, without the final TTL.
-        #
         # Address format:
         #    Type   (1 octet)
         #    Length (1 octet)
@@ -476,14 +690,12 @@ class TorSocket:
         #    0x06 -- IPv6 address
         #    0xF0 -- Error, transient
         #    0xF1 -- Error, nontransient
-        self._socket.write(Cell(
-            0, CommandType.NETINFO, [
-                time(),
-                0x04, 0x04, self._guard_relay.ip,
-                0x01,
-                0x04, 0x04, 0
-            ]
-        ).get_bytes())
+        self._socket.write(Cell(0, CommandType.NETINFO, [
+            time(),
+            0x04, 0x04, self._guard_relay.ip,
+            0x01,
+            0x04, 0x04, 0
+        ]).get_bytes())
 
 
 class TinyTor:
@@ -514,13 +726,27 @@ class TinyTor:
         :type url: str
         :rtype: str
         """
-        guard_relay = self._consensus.get_guard_relay()
+        while True:
+            try:
+                guard_relay = self._consensus.get_guard_relay()
 
-        log.debug("Using guard relay \"%s\"..." % guard_relay.nickname)
-        log.debug("Descriptor URL: %s" % guard_relay.get_descriptor_url())
+                log.debug("Using guard relay \"%s\"..." % guard_relay.nickname)
+                log.debug("Descriptor URL: %s" % guard_relay.get_descriptor_url())
+                log.debug("Parsing the guard relays keys...")
+
+                # Populate the guard relay's keys...
+                # Filters may block visiting the guard relay's descriptor URL.
+                # Let's loop until that doesn't happen.
+                guard_relay.parse_descriptor()
+                break
+            except Exception as ex:
+                log.error(str(ex))
+                log.info("Retrying with a different guard relay...")
 
         # Start communicating with the guard relay.
         tor_socket = TorSocket(guard_relay)
+
+        return "TINYTOR_IMPLEMENTATION_IS_NOT_FINISHED"
 
 
 def main():
@@ -534,13 +760,13 @@ def main():
     if not arguments.no_banner:
         print(BANNER)
     if not arguments.host.endswith(".onion"):
-        log.error("Invalid onion service specified.")
+        log.error("Please specify a valid onion service (--host).")
         exit(1)
     if arguments.verbose:
         log.setLevel(logging.DEBUG)
 
     tinytor = TinyTor()
-    tinytor.http_get("example.onion")
+    log.info("Received response: \n%s" % tinytor.http_get("example.onion"))
 
 
 if __name__ == '__main__':
