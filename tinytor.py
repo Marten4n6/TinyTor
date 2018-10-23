@@ -16,6 +16,7 @@ from argparse import ArgumentParser
 from base64 import b64encode, b64decode, b16encode
 from os import urandom
 from sys import exit
+from textwrap import dedent
 from time import time
 
 BANNER = """\
@@ -101,20 +102,60 @@ class OnionRouter:
                 else:
                     key_tap += line
 
-        # IMPORTANT:
         # The openssl rsa command only works with PKCS#8 formatted public keys.
         # "BEGIN RSA PUBLIC KEY" is PKCS#1, which can only contain RSA keys.
         # "BEGIN PUBLIC KEY" is PKCS#8, which can contain a variety of formats.
+        # macOS / OSX doesn't support "-RSAPublicKey_in" for converting the keys (https://stackoverflow.com/a/27930720).
+        # So fuck it, we'll convert the key to the new format manually then.
+        self.key_tap = self._key_tap_to_der(key_tap)
 
-        # macOS / OSX doesn't support "-RSAPublicKey_in" (https://stackoverflow.com/a/27930720)
-        # So fuck it, we'll do it manually then.
-        # https://tls.mbed.org/kb/cryptography/asn1-key-structures-in-der-and-pem
-        # https://www.openssl.org/docs/man1.0.2/apps/asn1parse.html
-        # https://stackoverflow.com/a/29707204
-        # TODO -
-        log.debug("Converting guard public key to DER format...")
+    @staticmethod
+    def _key_tap_to_der(key_tap):
+        """Converts a PKCS#1 key to PKCS#8 by building it manually using asn1parse.
+        This is where the magic happens and many hours were spent...
 
-        self.key_tap = key_tap
+        :type key_tap: str
+        :rtype: bytes
+        """
+        log.debug("Creating PKCS#8 DER public key from existing key...")
+
+        # Get the key's modulus and exponent via asn1parse.
+        out, err = subprocess.Popen("echo '%s' | openssl asn1parse -in /dev/stdin" % key_tap,
+                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+        output = (out + err).decode()
+
+        modulus = output.split("\n")[1].split(" :")[1]
+        exponent = output.split("\n")[2].split(" :")[1]
+
+        # https://www.openssl.org/docs/man1.0.2/crypto/ASN1_generate_nconf.html
+        configuration = dedent("""\
+        # Start with a SEQUENCE
+        asn1=SEQUENCE:pubkeyinfo
+
+        # pubkeyinfo contains an algorithm identifier and the public key wrapped
+        # in a BIT STRING
+        [pubkeyinfo]
+        algorithm=SEQUENCE:rsa_alg
+        pubkey=BITWRAP,SEQUENCE:rsapubkey
+
+        # algorithm ID for RSA is just an OID and a NULL
+        [rsa_alg]
+        algorithm=OID:rsaEncryption
+        parameter=NULL
+
+        # Actual public key: modulus and exponent
+        [rsapubkey]
+        n=INTEGER:0x%s
+
+        e=INTEGER:0x%s
+        """ % (modulus, exponent))
+
+        # Generate the public key and output in DER (bytes) format.
+        out, err = subprocess.Popen("echo '%s' | openssl asn1parse -genconf /dev/stdin -noout -out /dev/stdout"
+                                    % configuration, shell=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+
+        return out + err
 
     def __str__(self):
         return "OnionRouter(nickname=%s, ip=%s, dir_port=%s, tor_port=%s, fingerprint=%s, flags=%s, key_tap=%s)" % (
@@ -730,6 +771,11 @@ class TinyTor:
             try:
                 guard_relay = self._consensus.get_guard_relay()
 
+                if guard_relay.dir_port == 0:
+                    # Some guard relays don't seem to support retrieving
+                    # the descriptors over HTTP.
+                    continue
+
                 log.debug("Using guard relay \"%s\"..." % guard_relay.nickname)
                 log.debug("Descriptor URL: %s" % guard_relay.get_descriptor_url())
                 log.debug("Parsing the guard relays keys...")
@@ -766,7 +812,7 @@ def main():
         log.setLevel(logging.DEBUG)
 
     tinytor = TinyTor()
-    log.info("Received response: \n%s" % tinytor.http_get("example.onion"))
+    log.info("Received response: \n%s" % tinytor.http_get(arguments.host))
 
 
 if __name__ == '__main__':
