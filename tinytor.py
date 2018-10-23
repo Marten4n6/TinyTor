@@ -227,16 +227,11 @@ class Consensus:
                 tor_port = int(split_line[7])
                 dir_port = int(split_line[8])
 
-                while True:
-                    try:
-                        # The fingerprint here is base64 encoded bytes.
-                        # The descriptor URL uses the base16 encoded value of these bytes.
-                        # Documentation for this was hard to find...
-                        identity = b16encode(b64decode(identity.encode())).decode()
-                        break
-                    except binascii.Error:
-                        # Incorrect base64 padding.
-                        identity = identity + "="
+                # The fingerprint here is base64 encoded bytes.
+                # The descriptor URL uses the base16 encoded value of these bytes.
+                # Documentation for this was hard to find...
+                identity += '=' * (-len(identity) % 4)
+                identity = b16encode(b64decode(identity.encode())).decode()
 
                 onion_router = OnionRouter(nickname, ip, dir_port, tor_port, identity)
             elif line.startswith("s "):
