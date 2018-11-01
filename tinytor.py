@@ -4,7 +4,6 @@ __author__ = "Marten4n6"
 __license__ = "GPLv3"
 __version__ = "0.0.1"
 
-import binascii
 import logging
 import random
 import socket
@@ -14,6 +13,7 @@ import subprocess
 import urllib.request
 from argparse import ArgumentParser
 from base64 import b64encode, b64decode, b16encode
+from binascii import hexlify
 from os import urandom
 from sys import exit
 from textwrap import dedent
@@ -407,22 +407,27 @@ class HybridEncryption:
 
     # tor-spec.txt 0.3. "Ciphers"
     KEY_LEN = 16
+    DH_LEN = 128
+    HASH_LEN = 20
     PK_ENC_LEN = 128
     PK_PAD_LEN = 42
 
     PK_DATA_LEN = (PK_ENC_LEN - PK_PAD_LEN)
     PK_DATA_LEN_WITH_KEY = (PK_DATA_LEN - KEY_LEN)
 
-    def encrypt(self, my_public_key, guard_public_key):
-        """Encrypts the data with the guard relay's TAP public key.
+    TAP_C_HANDSHAKE_LEN = (DH_LEN + KEY_LEN + PK_PAD_LEN)
+    TAP_S_HANDSHAKE_LEN = (DH_LEN + HASH_LEN)
 
-        :type my_public_key: bytes
-        :type guard_public_key: guard_public_key_bytes
+    def encrypt(self, data, public_key):
+        """Encrypts the data with the specified public key.
+
+        :type data: bytes
+        :type public_key: bytes
         :rtype: bytes
         """
         # M = data
 
-        if len(my_public_key) < self.PK_DATA_LEN:
+        if len(data) < self.PK_DATA_LEN:
             # 1. If the length of M is no more than PK_ENC_LEN-PK_PAD_LEN,
             #    pad and encrypt M with PK.
             #
@@ -431,31 +436,46 @@ class HybridEncryption:
             log.error("FAILED TO ENCRYPT USING HYBRID ENCRYPTION, THIS SHOULDN'T HAPPEN.")
             log.error("Please submit an issue on GitHub!")
             exit(1)
-        else:
-            # 2. Otherwise, generate a KEY_LEN byte random key K.
-            random_key_bytes = urandom(self.KEY_LEN)
 
-            # Let M1 = the first PK_ENC_LEN-PK_PAD_LEN-KEY_LEN bytes of M,
-            # and let M2 = the rest of M.
-            m1 = my_public_key[:self.PK_DATA_LEN_WITH_KEY]
-            m2 = my_public_key[self.PK_DATA_LEN_WITH_KEY:]
+        # 2. Otherwise, generate a KEY_LEN byte random key K.
+        random_key_bytes = urandom(self.KEY_LEN)
 
-            # Pad and encrypt K|M1 with PK.
-            # tor-spec.txt 0.3. "Ciphers":
-            # We use OAEP-MGF1 padding, with SHA-1 as its digest function.
-            k_and_m1 = random_key_bytes + m1
+        # Let M1 = the first PK_ENC_LEN-PK_PAD_LEN-KEY_LEN bytes of M,
+        # and let M2 = the rest of M.
+        m1 = data[:self.PK_DATA_LEN_WITH_KEY]
+        m2 = data[self.PK_DATA_LEN_WITH_KEY:]
 
-            # Thanks https://superuser.com/a/431651
-            out, err = subprocess.Popen("(echo '%s' | base64 --decode; echo '%s' | base64 --decode) | "
-                                        "openssl rsautl -pubin -inform DER -inkey /dev/stdin -encrypt -in /dev/stdin"
-                                        % (b64encode(guard_public_key.encode()).decode(), b64encode(k_and_m1).decode()),
-                                        shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-            output = (out + err).decode()
+        # Pad and encrypt K|M1 with PK.
+        # tor-spec.txt 0.3. "Ciphers":
+        # We use OAEP-MGF1 padding, with SHA-1 as its digest function.
+        k_and_m1 = random_key_bytes + m1
 
-            # Encrypt M2 with our stream cipher, using the key K.
+        # Thanks https://superuser.com/a/431651
+        out, err = subprocess.Popen("(echo '%s' | openssl enc -base64 -d; echo '%s' | openssl enc -base64 -d) | "
+                                    "openssl rsautl -pubin -keyform DER -inkey /dev/stdin "
+                                    "-encrypt -oaep -in /dev/stdin"
+                                    % (b64encode(public_key).decode(), b64encode(k_and_m1).decode()),
+                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+        value1 = (out + err)
 
-            # Concatenate these encrypted values.
-            return "NOT_FINISHED"
+        # Encrypt M2 with our stream cipher, using the key K.
+        # tor-spec.txt:
+        # For a stream cipher, unless otherwise specified, we use 128-bit AES in
+        # counter mode, with an IV of all 0 bytes.
+        key_hex = hexlify(random_key_bytes).decode()
+
+        # Use -p to verify the IV is all 0's.
+        out, err = subprocess.Popen("echo '%s' | "
+                                    "openssl enc -aes-128-ctr -A -e -K %s -iv 00000000000000000000000000000000"
+                                    % (b64encode(m2).decode(), key_hex),
+                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+        value2 = (out + err)
+        
+        # Concatenate these encrypted values.
+        # The output length should be TAP_C_HANDSHAKE_LEN bytes.
+        onion_skin_data = value1 + value2
+
+        return onion_skin_data
 
 
 class KeyAgreementTAP:
