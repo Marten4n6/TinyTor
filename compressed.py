@@ -42,13 +42,55 @@ def main():
         print("[WARNING] Please DO NOT USE this, instead use pip (as usual)!")
         print("[INFO] Compressing TinyTor (%s)..." % source_path)
 
-        source_code = input_file.read()
-        encoded_and_compressed = compress(b64encode(source_code.encode()))
+        modified_source = ""
+        previous_line = ""
+        middle_of_docstring = False
+
+        for line in input_file:
+            if line.strip().startswith("# "):
+                # Strip out comments.
+                # print("[DEBUG] Skipping: " + line.replace("\n", ""))
+                continue
+            elif line.strip().startswith('"""') or middle_of_docstring:
+                # Strip out docstrings.
+                if len(line.split('"""')) == 3:
+                    # Two occurrences found, this is a single line docstring.
+                    # print("[DEBUG] Skipping: " + line.replace("\n", ""))
+                    continue
+                else:
+                    previous_line_last_char = previous_line.replace("\n", "")[(len(previous_line) - 2):]
+
+                    if line.strip().startswith('"""'):
+                        if previous_line_last_char == ":":
+                            # Start of a docstring.
+                            # print("[DEBUG] Skipping: " + line.replace("\n", ""))
+
+                            middle_of_docstring = True
+                            previous_line = line
+                            continue
+                        elif middle_of_docstring:
+                            # End of a docstring.
+                            # print("[DEBUG] Skipping: " + line.replace("\n", ""))
+
+                            middle_of_docstring = False
+                            previous_line = line
+                            continue
+
+                    if middle_of_docstring:
+                        # print("[DEBUG] Skipping: " + line.replace("\n", ""))
+                        continue
+                    else:
+                        modified_source += line
+            else:
+                modified_source += line
+                previous_line = line
+
+        encoded_and_compressed = compress(b64encode(modified_source.encode()))
 
         bytes_hash = sha256()
         bytes_hash.update(encoded_and_compressed)
 
-        print("[INFO] Old size: " + convert_size(len(source_code)))
+        print("[INFO] Old size: " + convert_size(path.getsize(source_path)))
         print("[INFO] New size: " + convert_size(len(encoded_and_compressed)))
         print("[INFO] Python code to dynamically load and use this library:")
 
