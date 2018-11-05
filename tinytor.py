@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """TinyTor is a Tor client implementation."""
 __author__ = "Marten4n6"
@@ -117,7 +118,7 @@ class OnionRouter:
         :type key_tap: str
         :rtype: bytes
         """
-        log.debug("Creating PKCS#8 DER public key from existing key...")
+        log.debug("Converting key to PKCS#8 DER...")
 
         # Get the key's modulus and exponent via asn1parse.
         out, err = subprocess.Popen("echo '%s' | openssl asn1parse -in /dev/stdin" % key_tap,
@@ -132,8 +133,8 @@ class OnionRouter:
         # Start with a SEQUENCE
         asn1=SEQUENCE:pubkeyinfo
 
-        # pubkeyinfo contains an algorithm identifier and the public key wrapped
-        # in a BIT STRING
+        # pubkeyinfo contains an algorithm identifier and the 
+        # public key wrapped in a BIT STRING
         [pubkeyinfo]
         algorithm=SEQUENCE:rsa_alg
         pubkey=BITWRAP,SEQUENCE:rsapubkey
@@ -197,10 +198,11 @@ class Consensus:
         """
         return random.choice(self._directory_authorities)
 
-    def parse_consensus(self, consensus_url):
+    def parse_consensus(self, consensus_url, limit=200):
         """Parses the consensus document into a list of onion routers.
 
         :type consensus_url: str
+        :type limit: int
         """
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 6.1; rv:60.0) Gecko/20100101 Firefox/60.0"
@@ -230,7 +232,7 @@ class Consensus:
                 # The fingerprint here is base64 encoded bytes.
                 # The descriptor URL uses the base16 encoded value of these bytes.
                 # Documentation for this was hard to find...
-                identity += '=' * (-len(identity) % 4)
+                identity += "=" * (-len(identity) % 4)
                 identity = b16encode(b64decode(identity.encode())).decode()
 
                 onion_router = OnionRouter(nickname, ip, dir_port, tor_port, identity)
@@ -244,17 +246,17 @@ class Consensus:
                             continue
                         flags.append(token.lower().replace("\n", "", 1))
 
-                    if "fast" in flags and "running" in flags and "valid" in flags:
+                    if "stable" in flags and "fast" in flags and "valid" in flags and "running" in flags:
                         onion_router_amount += 1
                         onion_router.flags = flags
 
                         self._parsed_consensus.append(onion_router)
 
-            if onion_router_amount >= 200:
-                log.warning("Stopped after reading 200 onion routers.")
+            if onion_router_amount >= limit:
+                log.warning("Stopped after reading %s onion routers." % limit)
                 break
 
-    def get_guard_relay(self):
+    def get_random_guard_relay(self):
         """
         :return: A random guard relay.
         :rtype: OnionRouter
@@ -371,11 +373,17 @@ class Cell:
         self.payload = payload
 
     def get_bytes(self):
-        """:return: The byte representation of this cell which can be written to a socket."""
+        """The byte representation of this cell which can be written to a socket.
+
+        :rtype: bytes
+        """
         payload_bytes = b""
 
         if self.command == CommandType.VERSIONS:
+            # The payload in a VERSIONS cell is a series of big-endian two-byte integers.
             payload_bytes = struct.pack("!" + ("H" * len(self.payload)), *self.payload)
+        else:
+            log.error("Invalid payload format for command: " + str(self.command))
 
         return struct.pack("!HBH", self.circuit_id, self.command, len(payload_bytes)) + payload_bytes
 
@@ -759,9 +767,21 @@ class TorSocket:
                 return Cell(circuit_id, command, payload)
 
     def _send_versions(self):
+        """
+        When the "in-protocol" handshake is used, implementations MUST NOT
+        list any version before 3, and SHOULD list at least version 3.
+
+        Link protocols differences are:
+          1 -- The "certs up front" handshake.
+          2 -- Uses the renegotiation-based handshake. Introduces
+               variable-length cells.
+          3 -- Uses the in-protocol handshake.
+          4 -- Increases circuit ID width to 4 bytes.
+          5 -- Adds support for link padding and negotiation (padding-spec.txt).
+        """
         log.debug("Sending VERSIONS cell...")
 
-        self._socket.write(Cell(0, CommandType.VERSIONS, [3, 4, 5]).get_bytes())
+        self.send_cell(Cell(0, CommandType.VERSIONS, [3, 4]))
 
     def _retrieve_versions(self):
         log.debug("Retrieving VERSIONS cell...")
@@ -782,33 +802,36 @@ class TorSocket:
         self.retrieve_cell(ignore_response=True)
 
     def _send_net_info(self):
+        """
+        If version 2 or higher is negotiated, each party sends the other a NETINFO cell.
+        The cell's payload is:
+
+        - Timestamp              [4 bytes]
+        - Other OR's address     [variable]
+        - Number of addresses    [1 byte]
+        - This OR's addresses    [variable]
+
+        Address format:
+
+        - Type   (1 octet)
+        - Length (1 octet)
+        - Value  (variable-width)
+        "Length" is the length of the Value field.
+        "Type" is one of:
+        - 0x00 -- Hostname
+        - 0x04 -- IPv4 address
+        - 0x06 -- IPv6 address
+        - 0xF0 -- Error, transient
+        - 0xF1 -- Error, nontransient
+        """
         log.debug("Sending NET_INFO cell...")
 
-        # If version 2 or higher is negotiated, each party sends the other a
-        # NETINFO cell.  The cell's payload is:
-        #
-        #    Timestamp              [4 bytes]
-        #    Other OR's address     [variable]
-        #    Number of addresses    [1 byte]
-        #    This OR's addresses    [variable]
-        #
-        # Address format:
-        #    Type   (1 octet)
-        #    Length (1 octet)
-        #    Value  (variable-width)
-        # "Length" is the length of the Value field.
-        # "Type" is one of:
-        #    0x00 -- Hostname
-        #    0x04 -- IPv4 address
-        #    0x06 -- IPv6 address
-        #    0xF0 -- Error, transient
-        #    0xF1 -- Error, nontransient
-        self._socket.write(Cell(0, CommandType.NETINFO, [
-            time(),
-            0x04, 0x04, self._guard_relay.ip,
+        self.send_cell(Cell(0, CommandType.NETINFO, [
+            int(time()),
+            [0x04, 0x04, self._guard_relay.ip],
             0x01,
-            0x04, 0x04, 0
-        ]).get_bytes())
+            [0x04, 0x04, 0]
+        ]))
 
 
 class TinyTor:
@@ -841,7 +864,7 @@ class TinyTor:
         """
         while True:
             try:
-                guard_relay = self._consensus.get_guard_relay()
+                guard_relay = self._consensus.get_random_guard_relay()
 
                 if guard_relay.dir_port == 0:
                     # Some guard relays don't seem to support retrieving
@@ -886,8 +909,8 @@ def main():
     if arguments.verbose:
         log.setLevel(logging.DEBUG)
 
-    tinytor = TinyTor()
-    log.info("Received response: \n%s" % tinytor.http_get(arguments.host))
+    tor = TinyTor()
+    log.info("Received response: \n%s" % tor.http_get(arguments.host))
 
 
 if __name__ == '__main__':
