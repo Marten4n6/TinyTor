@@ -594,19 +594,20 @@ class CircuitNode:
 class Circuit:
     """Handles circuit management."""
 
+    _CIRCUIT_COUNT = 0
+
     def __init__(self, tor_socket):
         """
         :type tor_socket: TorSocket
         """
         self._tor_socket = tor_socket
+        self._circuit_id = Circuit._CIRCUIT_COUNT + 1
 
-    def build(self):
-        """Builds a path to the "exit" relay."""
-        log.debug("Building a circuit...")
+    def get_circuit_id(self):
+        """:rtype: int"""
+        return self._circuit_id
 
-        self._send_create_cell()
-
-    def _send_create_cell(self):
+    def create(self):
         """
         Users set up circuits incrementally, one hop at a time. To create a
         new circuit, OPs send a CREATE/CREATE2 cell to the first node, with
@@ -618,22 +619,32 @@ class Circuit:
 
         See tor-spec.txt 5.1. "CREATE and CREATED cells"
         """
-        log.debug("Sending CREATE cell...")
+        log.debug("Sending CREATE2 cell...")
 
         circuit_node = CircuitNode(self, self._tor_socket.get_guard_relay())
         onion_skin = circuit_node.create_onion_skin()
 
-        # The format of a CREATE cell is one of the following:
-        #     HDATA     (Client Handshake Data)     [TAP_C_HANDSHAKE_LEN bytes]
-        # or
-        #     HTAG      (Client Handshake Type Tag) [16 bytes]
-        #     HDATA     (Client Handshake Data)     [TAP_C_HANDSHAKE_LEN-16 bytes]
-        self._tor_socket.send_cell(Cell(
-            0, CommandType.CREATE, [
-                "tap",
-                onion_skin
-            ]
-        ))
+        if len(onion_skin) != HybridEncryption.TAP_C_HANDSHAKE_LEN:
+            log.error("Invalid onion skin length (currently: %s) SHOULD BE %s." % (
+                len(onion_skin), HybridEncryption.TAP_C_HANDSHAKE_LEN
+            ))
+
+        # A CREATE2 cell contains:
+        #     HTYPE     (Client Handshake Type)     [2 bytes]
+        #     HLEN      (Client Handshake Data Len) [2 bytes]
+        #     HDATA     (Client Handshake Data)     [HLEN bytes]
+        self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, [
+            0x0000,  # TAP
+            len(onion_skin),
+            onion_skin
+        ]))
+
+    def handle_cell(self, cell):
+        """Handles a cell response related to this circuit, called by TorSocket.
+
+        :type cell: Cell
+        """
+        pass
 
 
 class TorSocket:
@@ -651,7 +662,17 @@ class TorSocket:
         )
         self._protocol_versions = None
 
-        self._connect()
+        # Dictionary of circuits this socket is attached to (key = circuit's ID).
+        self._circuits = dict()
+
+    def get_guard_relay(self):
+        """:return: The guard relay this socket is attached to."""
+        return self._guard_relay
+
+    def connect(self):
+        """Connects the socket to the guard relay."""
+        log.debug("Connecting socket to the guard relay...")
+        self._socket.connect((self._guard_relay.ip, self._guard_relay.tor_port))
 
         # When the in-protocol handshake is used, the initiator sends a
         # VERSIONS cell to indicate that it will not be renegotiating.  The
@@ -670,18 +691,13 @@ class TorSocket:
         self._retrieve_net_info()
         self._send_net_info()
 
-        # Build a circuit.
-        self._circuit = Circuit(self)
-        self._circuit.build()
+    def create_circuit(self):
+        """Creates a path to the final destination."""
+        circuit = Circuit(self)
+        circuit.create()
 
-    def get_guard_relay(self):
-        """:return: The guard relay this socket is attached to."""
-        return self._guard_relay
-
-    def _connect(self):
-        """Connects the socket to the guard relay."""
-        log.debug("Connecting socket to the guard relay...")
-        self._socket.connect((self._guard_relay.ip, self._guard_relay.tor_port))
+        log.debug("Circuit created, assigned ID: %s" % circuit.get_circuit_id())
+        self._circuits[circuit.get_circuit_id()] = circuit
 
     def send_cell(self, cell):
         """Sends a cell to the guard relay.
@@ -847,6 +863,9 @@ class TinyTor:
 
         # Start communicating with the guard relay.
         tor_socket = TorSocket(guard_relay)
+
+        tor_socket.connect()
+        tor_socket.create_circuit()
 
         return "TINYTOR_IMPLEMENTATION_IS_NOT_FINISHED"
 
