@@ -400,8 +400,7 @@ class Cell:
 
 class HybridEncryption:
     """
-    Encryption used to calculate the payload of a CREATE cell ('onion skin').
-
+    This is a static class for encryption used to calculate the payload of a CREATE cell ('onion skin').
     See tor-spec.txt 0.4. "A bad hybrid encryption algorithm, for legacy purposes."
     """
 
@@ -418,7 +417,8 @@ class HybridEncryption:
     TAP_C_HANDSHAKE_LEN = (DH_LEN + KEY_LEN + PK_PAD_LEN)
     TAP_S_HANDSHAKE_LEN = (DH_LEN + HASH_LEN)
 
-    def encrypt(self, data, public_key):
+    @staticmethod
+    def encrypt(data, public_key):
         """Encrypts the data with the specified public key.
 
         :type data: bytes
@@ -427,7 +427,7 @@ class HybridEncryption:
         """
         # M = data
 
-        if len(data) < self.PK_DATA_LEN:
+        if len(data) < HybridEncryption.PK_DATA_LEN:
             # 1. If the length of M is no more than PK_ENC_LEN-PK_PAD_LEN,
             #    pad and encrypt M with PK.
             #
@@ -438,12 +438,12 @@ class HybridEncryption:
             exit(1)
 
         # 2. Otherwise, generate a KEY_LEN byte random key K.
-        random_key_bytes = urandom(self.KEY_LEN)
+        random_key_bytes = urandom(HybridEncryption.KEY_LEN)
 
         # Let M1 = the first PK_ENC_LEN-PK_PAD_LEN-KEY_LEN bytes of M,
         # and let M2 = the rest of M.
-        m1 = data[:self.PK_DATA_LEN_WITH_KEY]
-        m2 = data[self.PK_DATA_LEN_WITH_KEY:]
+        m1 = data[:HybridEncryption.PK_DATA_LEN_WITH_KEY]
+        m2 = data[HybridEncryption.PK_DATA_LEN_WITH_KEY:]
 
         # Pad and encrypt K|M1 with PK.
         # tor-spec.txt 0.3. "Ciphers":
@@ -535,19 +535,6 @@ class KeyAgreementTAP:
         """:rtype: bytes"""
         return self._public_key
 
-    def get_onion_skin(self, my_public_key, guard_tap_public_key):
-        """
-        The payload for a CREATE cell is an 'onion skin', which consists of
-        the first step of the DH handshake data (also known as g^x).  This
-        value is encrypted using the "legacy hybrid encryption" algorithm.
-
-        See tor-spec.txt 5.1.3. The "TAP" handshake
-
-        :type my_public_key: bytes
-        :type guard_tap_public_key: bytes
-        """
-        return self._hybrid_encryption.encrypt(my_public_key, guard_tap_public_key)
-
 
 class CircuitNode:
     """Represents an onion router in the circuit."""
@@ -578,12 +565,11 @@ class CircuitNode:
         :rtype: bytes
         """
         handshake = KeyAgreementTAP()
-        hybrid_encryption = HybridEncryption()
-        
+
         log.debug("Our public key:\n%s" % handshake.get_public_key())
         log.debug("Onion router TAP key:\n%s" % self._onion_router.key_tap)
 
-        return hybrid_encryption.encrypt(handshake.get_public_key(), self._onion_router.key_tap)
+        return HybridEncryption.encrypt(handshake.get_public_key(), self._onion_router.key_tap)
 
 
 class Circuit:
