@@ -487,49 +487,68 @@ class KeyAgreementTAP:
     not very good.  (See Goldberg's "On the Security of the Tor
     Authentication Protocol".)
 
-    The reason for using TAP instead of NTOR is that
-    macOS / OSX comes with LibreSSL (2.2.7) which doesn't support curve25519.
+    The reason for using TAP instead of NTOR is that macOS / OSX comes
+    with LibreSSL (2.2.7) which doesn't support curve25519.
+
+    References:
+        https://archive.fo/iHkN8
+        https://tools.ietf.org/html/rfc2409#section-6.2
+        https://security.stackexchange.com/a/94397
+        https://sandilands.info/sgordon/diffie-hellman-secret-key-exchange-with-openssl
     """
 
     def __init__(self):
         self._hybrid_encryption = HybridEncryption()
-        self._private_key = None
-        self._public_key = None
+        self._private_key = self._create_private_key()
+        self._public_key = self._create_public_key()
 
-        self._create_private_key()
-        self._create_public_key()
+    @staticmethod
+    def _create_private_key():
+        """Creates a diffie hellman private key.
 
-    def _create_private_key(self):
-        """Generate a RSA private key."""
-        out, err = subprocess.Popen("openssl genrsa 1024", shell=True,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-        output = (out + err).decode()
+        For Diffie-Hellman, unless otherwise specified, we use a generator
+        (g) of 2.  For the modulus (p), we use the 1024-bit safe prime from
+        rfc2409 section 6.2 whose hex representation is:
 
-        private_key = ""
-        append_key = False
+          "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08"
+          "8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B"
+          "302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9"
+          "A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6"
+          "49286651ECE65381FFFFFFFFFFFFFFFF"
 
-        for line in output.splitlines(keepends=True):
-            if "BEGIN RSA PRIVATE KEY" in line:
-                private_key += line
-                append_key = True
-                continue
+        This is called the "Second Oakley Group" (1024-bit MODP group).
+        See tor-spec.txt 0.3. "Ciphers".
 
-            if append_key:
-                if "END RSA PRIVATE KEY" in line:
-                    private_key += line.replace("\n", "")
-                    break
-                else:
-                    private_key += line
-
-        self._private_key = private_key
-        log.debug("Created private key (for hybrid encryption)...")
+        :rtype: bytes
+        """
+        parameters = dedent("""\
+        -----BEGIN DH PARAMETERS-----
+        MIGHAoGBAP//////////yQ/aoiFowjTExmKLgNwc0SkCTgiKZ8x0Agu+pjsTmyJRSgh5jjQE
+        3e+VGbPNOkMbMCsKbfJfFDdP4TVtbVHCReSFtXZiXn7G9ExC6aY37WsL/1y29Aa37e44a/ta
+        iZ+lrp8kEXxLH+ZJKGZR7OZTgf//////////AgEC
+        -----END DH PARAMETERS-----
+        """)
+        out, err = subprocess.Popen("echo '%s' | openssl genpkey -paramfile /dev/stdin -outform DER 2>/dev/null"
+                                    % parameters,
+                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+        return out + err
 
     def _create_public_key(self):
-        """:rtype: str"""
-        # Calculate (derive) the public key from the private key to DER (bytes) format.
-        out, err = subprocess.Popen("echo '%s' | openssl rsa -outform DER -pubout" % self._private_key,
+        """Creates a public key from the private key.
+
+        The first step of the DH handshake data (also known as g^x).
+
+        :rtype: bytes
+        """
+        out, err = subprocess.Popen("echo '%s' | openssl enc -base64 -d |"
+                                    "openssl pkey -inform DER -in /dev/stdin -pubout -outform DER"
+                                    % b64encode(self._private_key).decode(),
                                     shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-        self._public_key = (out + err)
+        return out + err
+
+    def get_private_key(self):
+        """:rtype: bytes"""
+        return self._private_key
 
     def get_public_key(self):
         """:rtype: bytes"""
