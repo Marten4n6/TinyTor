@@ -51,6 +51,10 @@ def main():
                 # Strip out comments.
                 # print("[DEBUG] Skipping: " + line.replace("\n", ""))
                 continue
+            elif line.strip() == "#":
+                # Strip out empty comments.
+                # print("[DEBUG] Skipping: " + line.replace("\n", ""))
+                continue
             elif line.strip().startswith('"""') or middle_of_docstring:
                 # Strip out docstrings.
                 if len(line.split('"""')) == 3:
