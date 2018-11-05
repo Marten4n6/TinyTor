@@ -470,7 +470,7 @@ class HybridEncryption:
                                     % (b64encode(m2).decode(), key_hex),
                                     shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
         value2 = (out + err)
-        
+
         # Concatenate these encrypted values.
         # The output length should be TAP_C_HANDSHAKE_LEN bytes.
         onion_skin_data = value1 + value2
@@ -549,6 +549,43 @@ class KeyAgreementTAP:
         return self._hybrid_encryption.encrypt(my_public_key, guard_tap_public_key)
 
 
+class CircuitNode:
+    """Represents an onion router in the circuit."""
+
+    def __init__(self, circuit, onion_router):
+        """
+        :type circuit: Circuit
+        :type onion_router: OnionRouter
+        """
+        self._circuit = circuit
+        self._onion_router = onion_router
+
+    def get_onion_router(self):
+        """:rtype: OnionRouter"""
+        return self._onion_router
+
+    def get_circuit(self):
+        """:return: The circuit this node belongs to."""
+        return self._circuit
+
+    def create_onion_skin(self):
+        """
+        The payload for a CREATE cell is an 'onion skin', which consists of
+        the first step of the DH handshake data (also known as g^x).  This
+        value is encrypted using the "legacy hybrid encryption" algorithm.
+
+        See tor-spec.txt 5.1.3. The "TAP" handshake
+        :rtype: bytes
+        """
+        handshake = KeyAgreementTAP()
+        hybrid_encryption = HybridEncryption()
+        
+        log.debug("Our public key:\n%s" % handshake.get_public_key())
+        log.debug("Onion router TAP key:\n%s" % self._onion_router.key_tap)
+
+        return hybrid_encryption.encrypt(handshake.get_public_key(), self._onion_router.key_tap)
+
+
 class Circuit:
     """Handles circuit management."""
 
@@ -557,7 +594,6 @@ class Circuit:
         :type tor_socket: TorSocket
         """
         self._tor_socket = tor_socket
-        self._handshake_tap = KeyAgreementTAP()
 
     def build(self):
         """Builds a path to the "exit" relay."""
@@ -579,6 +615,9 @@ class Circuit:
         """
         log.debug("Sending CREATE cell...")
 
+        circuit_node = CircuitNode(self, self._tor_socket.get_guard_relay())
+        onion_skin = circuit_node.create_onion_skin()
+
         # The format of a CREATE cell is one of the following:
         #     HDATA     (Client Handshake Data)     [TAP_C_HANDSHAKE_LEN bytes]
         # or
@@ -587,10 +626,7 @@ class Circuit:
         self._tor_socket.send_cell(Cell(
             0, CommandType.CREATE, [
                 "tap",
-                self._handshake_tap.get_onion_skin(
-                    self._handshake_tap.get_public_key(),
-                    self._tor_socket.get_guard_relay().key_tap
-                )
+                onion_skin
             ]
         ))
 
