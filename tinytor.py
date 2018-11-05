@@ -377,11 +377,36 @@ class Cell:
 
         :rtype: bytes
         """
+        # https://docs.python.org/3/library/struct.html
         payload_bytes = b""
 
         if self.command == CommandType.VERSIONS:
             # The payload in a VERSIONS cell is a series of big-endian two-byte integers.
             payload_bytes = struct.pack("!" + ("H" * len(self.payload)), *self.payload)
+        elif self.command == CommandType.NETINFO:
+            # Timestamp              [4 bytes]
+            # Other OR's address     [variable]
+            # Number of addresses    [1 byte]
+            # This OR's addresses    [variable]
+            #
+            # Address format:
+            # Type   (1 octet)
+            # Length (1 octet)
+            # Value  (variable-width)
+            #
+            # "Length" is the length of the Value field.
+            # "Type" is one of:
+            #    0x00 -- Hostname
+            #    0x04 -- IPv4 address
+            #    0x06 -- IPv6 address
+            #    0xF0 -- Error, transient
+            #    0xF1 -- Error, nontransient
+            timestamp = struct.pack("!I", self.payload[0])
+            other_or_address = struct.pack("!BB", 4, 4) + socket.inet_aton(self.payload[1][2])
+            number_of_addresses = struct.pack("!B", 1)
+            this_or_address = struct.pack("!BB", 4, 4) + socket.inet_aton(self.payload[3][2])
+
+            payload_bytes = timestamp + other_or_address + number_of_addresses + this_or_address
         else:
             log.error("Invalid payload format for command: " + str(self.command))
 
@@ -722,7 +747,7 @@ class TorSocket:
         # https://docs.python.org/3/library/struct.html
 
         # Link protocol 4 increases circuit ID width to 4 bytes.
-        if self._protocol_versions and self._protocol_versions[len(self._protocol_versions) - 1] >= 4:
+        if self._protocol_versions and max(self._protocol_versions) >= 4:
             circuit_id = struct.unpack("!i", self._socket.read(4))[0]
         else:
             circuit_id = struct.unpack("!H", self._socket.read(2))[0]
@@ -830,7 +855,7 @@ class TorSocket:
             int(time()),
             [0x04, 0x04, self._guard_relay.ip],
             0x01,
-            [0x04, 0x04, 0]
+            [0x04, 0x04, "0"]
         ]))
 
 
