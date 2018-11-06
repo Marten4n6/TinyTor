@@ -11,7 +11,6 @@ import socket
 import ssl
 import struct
 import subprocess
-import urllib.request
 from argparse import ArgumentParser
 from base64 import b64encode, b64decode, b16encode
 from binascii import hexlify
@@ -20,6 +19,12 @@ from sys import exit
 from textwrap import dedent
 from threading import Thread
 from time import time
+
+try:
+    from urllib.request import Request, urlopen
+except ImportError:
+    # Python2 support.
+    from urllib2 import Request, urlopen
 
 BANNER = """\
   _____  _               _____            
@@ -84,8 +89,8 @@ class OnionRouter:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 6.1; rv:60.0) Gecko/20100101 Firefox/60.0"
         }
-        request = urllib.request.Request(url=self.get_descriptor_url(), headers=headers)
-        response = urllib.request.urlopen(request)
+        request = Request(url=self.get_descriptor_url(), headers=headers)
+        response = urlopen(request)
 
         key_tap = ""
         append_tap = False
@@ -208,8 +213,8 @@ class Consensus:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 6.1; rv:60.0) Gecko/20100101 Firefox/60.0"
         }
-        request = urllib.request.Request(url=consensus_url, headers=headers)
-        response = urllib.request.urlopen(request, timeout=8)
+        request = Request(url=consensus_url, headers=headers)
+        response = urlopen(request, timeout=8)
 
         onion_router_amount = 1
 
@@ -408,6 +413,12 @@ class Cell:
             this_or_address = struct.pack("!BB", 4, 4) + socket.inet_aton(self.payload[3][2])
 
             payload_bytes = timestamp + other_or_address + number_of_addresses + this_or_address
+        elif self.command == CommandType.CREATE2:
+            # A CREATE2 cell contains:
+            #     HTYPE     (Client Handshake Type)     [2 bytes]
+            #     HLEN      (Client Handshake Data Len) [2 bytes]
+            #     HDATA     (Client Handshake Data)     [HLEN bytes]
+            pass
         else:
             log.error("Invalid payload format for command: " + str(self.command))
 
@@ -930,7 +941,7 @@ class TinyTor:
         try:
             tor_socket.connect()
             tor_socket.create_circuit()
-        except ConnectionResetError as ex:
+        except Exception as ex:
             log.error(str(ex))
             log.info("Retrying to perform HTTP request...")
             self.http_get(url)
