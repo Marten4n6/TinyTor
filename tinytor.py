@@ -18,6 +18,7 @@ from binascii import hexlify
 from os import urandom
 from sys import exit
 from textwrap import dedent
+from threading import Thread
 from time import time
 
 BANNER = """\
@@ -724,6 +725,9 @@ class TorSocket:
         self._retrieve_net_info()
         self._send_net_info()
 
+        receive_cell_loop = Thread(target=self._receive_cell_loop)
+        receive_cell_loop.start()
+
     def create_circuit(self):
         """Creates a path to the final destination."""
         circuit = Circuit(self)
@@ -790,6 +794,17 @@ class TorSocket:
                 log.debug("Payload: " + str(payload))
                 log.debug("===== END UNKNOWN CELL   =====")
                 return Cell(circuit_id, command, payload)
+
+    def _receive_cell_loop(self):
+        """Loop which receives cells and passes them onto the associated circuit."""
+        log.debug("Starting cell receive loop...")
+
+        while True:
+            cell = self.retrieve_cell()
+
+            self._circuits[cell.circuit_id].handle(cell)
+
+            log.debug("Cell received, waiting for cell...")
 
     def _send_versions(self):
         """
@@ -912,8 +927,13 @@ class TinyTor:
         # Start communicating with the guard relay.
         tor_socket = TorSocket(guard_relay)
 
-        tor_socket.connect()
-        tor_socket.create_circuit()
+        try:
+            tor_socket.connect()
+            tor_socket.create_circuit()
+        except ConnectionResetError as ex:
+            log.error(str(ex))
+            log.info("Retrying to perform HTTP request...")
+            self.http_get(url)
 
         return "TINYTOR_IMPLEMENTATION_IS_NOT_FINISHED"
 
