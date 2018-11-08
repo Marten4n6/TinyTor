@@ -14,6 +14,7 @@ import subprocess
 from argparse import ArgumentParser
 from base64 import b64encode, b64decode, b16encode
 from binascii import hexlify
+from binascii import unhexlify
 from os import urandom
 from sys import exit
 from textwrap import dedent
@@ -534,70 +535,62 @@ class KeyAgreementTAP:
 
     The reason for using TAP instead of NTOR is that macOS / OSX comes
     with LibreSSL (2.2.7) which doesn't support curve25519.
-
-    References:
-        https://archive.fo/iHkN8
-        https://tools.ietf.org/html/rfc2409#section-6.2
-        https://security.stackexchange.com/a/94397
-        https://sandilands.info/sgordon/diffie-hellman-secret-key-exchange-with-openssl
     """
+
+    # For Diffie-Hellman, unless otherwise specified, we use a generator (g) of 2.
+    DH_G = 2
+
+    # For the modulus (p), we use the 1024-bit safe prime from
+    # rfc2409 section 6.2 whose hex representation is:
+    DH_P_HEX = \
+        "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08" \
+        "8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B" \
+        "302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9" \
+        "A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6" \
+        "49286651ECE65381FFFFFFFFFFFFFFFF"
+    DH_P = int(DH_P_HEX, 16)
+
+    # The number of bytes used in a Diffie-Hellman private key (x).
+    DH_SEC_LEN = 40
+
+    # The number of bytes used to represent a member of the Diffie-Hellman group.
+    DH_LEN = 128
 
     def __init__(self):
         self._hybrid_encryption = HybridEncryption()
-        self._private_key = self._create_private_key()
-        self._public_key = self._create_public_key()
+        self._private_key = random.randint(0, 256 ** self.DH_SEC_LEN - 1)
+        self._public_key = pow(self.DH_G, self._private_key, self.DH_P)
 
     @staticmethod
-    def _create_private_key():
-        """Creates a diffie hellman private key.
-
-        For Diffie-Hellman, unless otherwise specified, we use a generator
-        (g) of 2.  For the modulus (p), we use the 1024-bit safe prime from
-        rfc2409 section 6.2 whose hex representation is:
-
-          "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08"
-          "8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B"
-          "302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9"
-          "A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6"
-          "49286651ECE65381FFFFFFFFFFFFFFFF"
-
-        This is called the "Second Oakley Group" (1024-bit MODP group).
-        See tor-spec.txt 0.3. "Ciphers".
+    def _long_to_bytes(val, endian_type="big"):
+        """Thanks to https://stackoverflow.com/a/14527004
 
         :rtype: bytes
         """
-        parameters = dedent("""\
-        -----BEGIN DH PARAMETERS-----
-        MIGHAoGBAP//////////yQ/aoiFowjTExmKLgNwc0SkCTgiKZ8x0Agu+pjsTmyJRSgh5jjQE
-        3e+VGbPNOkMbMCsKbfJfFDdP4TVtbVHCReSFtXZiXn7G9ExC6aY37WsL/1y29Aa37e44a/ta
-        iZ+lrp8kEXxLH+ZJKGZR7OZTgf//////////AgEC
-        -----END DH PARAMETERS-----
-        """)
-        out, err = subprocess.Popen("echo '%s' | openssl genpkey -paramfile /dev/stdin -outform DER 2>/dev/null"
-                                    % parameters,
-                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-        return out + err
+        width = val.bit_length()
+        width += 8 - ((width % 8) or 8)
+        fmt = "%%0%dx" % (width // 4)
+        s = unhexlify(fmt % val)
 
-    def _create_public_key(self):
-        """Creates a public key from the private key.
+        if endian_type == "little":
+            # See http://stackoverflow.com/a/931095/309233
+            s = s[::-1]
 
-        The first step of the DH handshake data (also known as g^x).
-
-        :rtype: bytes
-        """
-        out, err = subprocess.Popen("echo '%s' | openssl enc -base64 -d |"
-                                    "openssl pkey -inform DER -in /dev/stdin -pubout -outform DER"
-                                    % b64encode(self._private_key).decode(),
-                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-        return out + err
-
-    def get_private_key(self):
-        """:rtype: bytes"""
-        return self._private_key
+        return s
 
     def get_public_key(self):
-        """:rtype: bytes"""
+        """
+        :return: The first step of the DH handshake data (also known as g^x).
+        :rtype: long
+        """
         return self._public_key
+
+    def get_public_key_bytes(self):
+        """
+        :return: The byte representation of our public key.
+        :rtype: bytes
+        """
+        return self._long_to_bytes(self.get_public_key())
 
 
 class CircuitNode:
