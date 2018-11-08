@@ -20,6 +20,7 @@ from sys import exit
 from textwrap import dedent
 from threading import Thread
 from time import time
+import traceback
 
 try:
     from urllib.request import Request, urlopen
@@ -623,10 +624,7 @@ class CircuitNode:
         """
         handshake = KeyAgreementTAP()
 
-        log.debug("Our public key:\n%s" % handshake.get_public_key())
-        log.debug("Onion router TAP key:\n%s" % self._onion_router.key_tap)
-
-        return HybridEncryption.encrypt(handshake.get_public_key(), self._onion_router.key_tap)
+        return HybridEncryption.encrypt(handshake.get_public_key_bytes(), self._onion_router.key_tap)
 
 
 class Circuit:
@@ -925,7 +923,7 @@ class TinyTor:
                 guard_relay.parse_descriptor()
                 break
             except Exception as ex:
-                log.error(str(ex))
+                traceback.print_exc()
                 log.info("Retrying with a different guard relay...")
 
         # Start communicating with the guard relay.
@@ -935,7 +933,7 @@ class TinyTor:
             tor_socket.connect()
             tor_socket.create_circuit()
         except Exception as ex:
-            log.error(str(ex))
+            traceback.print_exc()
             log.info("Retrying to perform HTTP request...")
             self.http_get(url)
 
