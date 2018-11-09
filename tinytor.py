@@ -380,9 +380,10 @@ class Cell:
         self.command = command
         self.payload = payload
 
-    def get_bytes(self):
+    def get_bytes(self, max_protocol_version=None):
         """The byte representation of this cell which can be written to a socket.
 
+        :type max_protocol_version: int
         :rtype: bytes
         """
         # https://docs.python.org/3/library/struct.html
@@ -420,11 +421,17 @@ class Cell:
             #     HTYPE     (Client Handshake Type)     [2 bytes]
             #     HLEN      (Client Handshake Data Len) [2 bytes]
             #     HDATA     (Client Handshake Data)     [HLEN bytes]
-            pass
+            payload_bytes = struct.pack("!HH", self.payload[0], self.payload[1]) + self.payload[2]
         else:
             log.error("Invalid payload format for command: " + str(self.command))
 
-        return struct.pack("!HBH", self.circuit_id, self.command, len(payload_bytes)) + payload_bytes
+        if max_protocol_version and max_protocol_version >= 4:
+            # Link protocol 4 increases circuit ID width to 4 bytes.
+            header = struct.pack("!iBH", self.circuit_id, self.command, len(payload_bytes))
+        else:
+            header = struct.pack("!HBH", self.circuit_id, self.command, len(payload_bytes))
+
+        return header + payload_bytes
 
     @staticmethod
     def is_variable_length_command(command):
@@ -743,7 +750,10 @@ class TorSocket:
 
         :type cell: Cell
         """
-        self._socket.write(cell.get_bytes())
+        if self._protocol_versions:
+            self._socket.write(cell.get_bytes(max(self._protocol_versions)))
+        else:
+            self._socket.write(cell.get_bytes())
 
     def retrieve_cell(self, ignore_response=False):
         """Waits for a cell response then parses it into a Cell object.
