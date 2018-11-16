@@ -452,153 +452,6 @@ class Cell:
             return False
 
 
-class HybridEncryption:
-    """
-    This is a static class for encryption used to calculate the payload of a CREATE cell ('onion skin').
-    See tor-spec.txt 0.4. "A bad hybrid encryption algorithm, for legacy purposes."
-    """
-
-    # tor-spec.txt 0.3. "Ciphers"
-    KEY_LEN = 16
-    DH_LEN = 128
-    HASH_LEN = 20
-    PK_ENC_LEN = 128
-    PK_PAD_LEN = 42
-
-    PK_DATA_LEN = (PK_ENC_LEN - PK_PAD_LEN)
-    PK_DATA_LEN_WITH_KEY = (PK_DATA_LEN - KEY_LEN)
-
-    TAP_C_HANDSHAKE_LEN = (DH_LEN + KEY_LEN + PK_PAD_LEN)
-    TAP_S_HANDSHAKE_LEN = (DH_LEN + HASH_LEN)
-
-    @staticmethod
-    def encrypt(data, public_key):
-        """Encrypts the data with the specified public key.
-
-        :type data: bytes
-        :type public_key: bytes
-        :rtype: bytes
-        """
-        # M = data
-
-        if len(data) < HybridEncryption.PK_DATA_LEN:
-            # 1. If the length of M is no more than PK_ENC_LEN-PK_PAD_LEN,
-            #    pad and encrypt M with PK.
-            #
-            # "Also note that as used in Tor's protocols, case 1 never occurs."
-            # So apparently this should never occur?
-            log.error("FAILED TO ENCRYPT USING HYBRID ENCRYPTION, THIS SHOULDN'T HAPPEN.")
-            log.error("Please submit an issue on GitHub!")
-            exit(1)
-
-        # 2. Otherwise, generate a KEY_LEN byte random key K.
-        random_key_bytes = urandom(HybridEncryption.KEY_LEN)
-
-        # Let M1 = the first PK_ENC_LEN-PK_PAD_LEN-KEY_LEN bytes of M,
-        # and let M2 = the rest of M.
-        m1 = data[:HybridEncryption.PK_DATA_LEN_WITH_KEY]
-        m2 = data[HybridEncryption.PK_DATA_LEN_WITH_KEY:]
-
-        # Pad and encrypt K|M1 with PK.
-        # tor-spec.txt 0.3. "Ciphers":
-        # We use OAEP-MGF1 padding, with SHA-1 as its digest function.
-        k_and_m1 = random_key_bytes + m1
-
-        # Thanks https://superuser.com/a/431651
-        out, err = subprocess.Popen("(echo '%s' | openssl enc -base64 -d; echo '%s' | openssl enc -base64 -d) | "
-                                    "openssl rsautl -pubin -keyform DER -inkey /dev/stdin "
-                                    "-encrypt -oaep -in /dev/stdin"
-                                    % (b64encode(public_key).decode(), b64encode(k_and_m1).decode()),
-                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-        value1 = (out + err)
-
-        # Encrypt M2 with our stream cipher, using the key K.
-        # tor-spec.txt:
-        # For a stream cipher, unless otherwise specified, we use 128-bit AES in
-        # counter mode, with an IV of all 0 bytes.
-        key_hex = hexlify(random_key_bytes).decode()
-
-        # Use -p to verify the IV is all 0's.
-        out, err = subprocess.Popen("echo '%s' | "
-                                    "openssl enc -aes-128-ctr -A -e -K %s -iv 00000000000000000000000000000000"
-                                    % (b64encode(m2).decode(), key_hex),
-                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-        value2 = (out + err)
-
-        # Concatenate these encrypted values.
-        # The output length should be TAP_C_HANDSHAKE_LEN bytes.
-        onion_skin_data = value1 + value2
-
-        return onion_skin_data
-
-
-class KeyAgreementTAP:
-    """
-    This handshake uses Diffie-Hellman in Z_p and RSA to compute a set of
-    shared keys which the client knows are shared only with a particular
-    server, and the server knows are shared with whomever sent the
-    original handshake (or with nobody at all).  It's not very fast and
-    not very good.  (See Goldberg's "On the Security of the Tor
-    Authentication Protocol".)
-
-    The reason for using TAP instead of NTOR is that macOS / OSX comes
-    with LibreSSL (2.2.7) which doesn't support curve25519.
-    """
-
-    # For Diffie-Hellman, unless otherwise specified, we use a generator (g) of 2.
-    DH_G = 2
-
-    # For the modulus (p), we use the 1024-bit safe prime from
-    # rfc2409 section 6.2 whose hex representation is:
-    DH_P_HEX = \
-        "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08" \
-        "8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B" \
-        "302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9" \
-        "A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6" \
-        "49286651ECE65381FFFFFFFFFFFFFFFF"
-    DH_P = int(DH_P_HEX, 16)
-
-    # The number of bytes used in a Diffie-Hellman private key (x).
-    DH_SEC_LEN = 40
-
-    # The number of bytes used to represent a member of the Diffie-Hellman group.
-    DH_LEN = 128
-
-    def __init__(self):
-        self._hybrid_encryption = HybridEncryption()
-        self._private_key = random.randint(0, 256 ** self.DH_SEC_LEN - 1)
-        self._public_key = pow(self.DH_G, self._private_key, self.DH_P)
-
-    @staticmethod
-    def _long_to_bytes(val, endian_type="big"):
-        """Thanks to https://stackoverflow.com/a/14527004
-
-        :rtype: bytes
-        """
-        width = val.bit_length()
-        width += 8 - ((width % 8) or 8)
-        fmt = "%%0%dx" % (width // 4)
-        s = unhexlify(fmt % val)
-
-        if endian_type == "little":
-            # See http://stackoverflow.com/a/931095/309233
-            s = s[::-1]
-
-        return s
-
-    def get_public_key(self):
-        """
-        :return: The first step of the DH handshake data (also known as g^x).
-        :rtype: long
-        """
-        return self._public_key
-
-    def get_public_key_bytes(self):
-        """
-        :return: The byte representation of our public key.
-        :rtype: bytes
-        """
-        return self._long_to_bytes(self.get_public_key())
 
 
 class CircuitNode:
@@ -629,9 +482,7 @@ class CircuitNode:
         See tor-spec.txt 5.1.3. The "TAP" handshake
         :rtype: bytes
         """
-        handshake = KeyAgreementTAP()
-
-        return HybridEncryption.encrypt(handshake.get_public_key_bytes(), self._onion_router.key_tap)
+        pass
 
 
 class Circuit:
@@ -662,25 +513,7 @@ class Circuit:
 
         See tor-spec.txt 5.1. "CREATE and CREATED cells"
         """
-        log.debug("Sending CREATE2 cell...")
-
-        circuit_node = CircuitNode(self, self._tor_socket.get_guard_relay())
-        onion_skin = circuit_node.create_onion_skin()
-
-        if len(onion_skin) != HybridEncryption.TAP_C_HANDSHAKE_LEN:
-            log.error("Invalid onion skin length (currently: %s) SHOULD BE %s." % (
-                len(onion_skin), HybridEncryption.TAP_C_HANDSHAKE_LEN
-            ))
-
-        # A CREATE2 cell contains:
-        #     HTYPE     (Client Handshake Type)     [2 bytes]
-        #     HLEN      (Client Handshake Data Len) [2 bytes]
-        #     HDATA     (Client Handshake Data)     [HLEN bytes]
-        self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, [
-            0x0000,  # TAP
-            len(onion_skin),
-            onion_skin
-        ]))
+        pass
 
     def handle_cell(self, cell):
         """Handles a cell response related to this circuit, called by TorSocket.
