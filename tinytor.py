@@ -452,8 +452,6 @@ class Cell:
             return False
 
 
-
-
 class CircuitNode:
     """Represents an onion router in the circuit."""
 
@@ -537,6 +535,7 @@ class TorSocket:
             ssl_version=ssl.PROTOCOL_SSLv23
         )
         self._protocol_versions = None
+        self._our_public_ip = "0"
 
         # Dictionary of circuits this socket is attached to (key = circuit's ID).
         self._circuits = dict()
@@ -632,6 +631,11 @@ class TorSocket:
                     payload = payload[2:]
 
                 return Cell(circuit_id, command, versions)
+            elif command == CommandType.NETINFO:
+                our_address_length = int(struct.unpack("!B", payload[5:][:1])[0])
+                our_address = socket.inet_ntoa(payload[6:][:our_address_length])
+
+                return Cell(circuit_id, command, [our_address])
             else:
                 log.debug("===== START UNKNOWN CELL =====")
                 log.debug("Circuit ID: " + str(circuit_id))
@@ -684,7 +688,10 @@ class TorSocket:
 
     def _retrieve_net_info(self):
         log.debug("Retrieving NET_INFO cell...")
-        self.retrieve_cell(ignore_response=True)
+        cell = self.retrieve_cell()
+
+        self._our_public_ip = cell.payload[0]
+        log.debug("Our public IP address: " + self._our_public_ip)
 
     def _send_net_info(self):
         """
@@ -715,7 +722,7 @@ class TorSocket:
             int(time()),
             [0x04, 0x04, self._guard_relay.ip],
             0x01,
-            [0x04, 0x04, "0"]
+            [0x04, 0x04, self._our_public_ip]
         ]))
 
 
