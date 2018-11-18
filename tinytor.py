@@ -5,28 +5,46 @@ __author__ = "Marten4n6"
 __license__ = "GPLv3"
 __version__ = "0.0.1"
 
+import hashlib
 import logging
+import operator
 import random
 import socket
 import ssl
 import struct
 import subprocess
+import sys
+import traceback
 from argparse import ArgumentParser
-from base64 import b64encode, b64decode, b16encode
-from binascii import hexlify
-from binascii import unhexlify
+from base64 import b64decode, b16encode
 from os import urandom
 from sys import exit
 from textwrap import dedent
 from threading import Thread
 from time import time
-import traceback
 
 try:
     from urllib.request import Request, urlopen
 except ImportError:
     # Python2 support.
     from urllib2 import Request, urlopen
+
+# Set up byte handling for Python 2 or 3.
+if sys.version_info.major == 2:
+    int2byte = chr
+    range = xrange
+
+
+    def indexbytes(buf, i):
+        return ord(buf[i])
+
+
+    def intlist2bytes(l):
+        return b"".join(chr(c) for c in l)
+else:
+    indexbytes = operator.getitem
+    intlist2bytes = bytes
+    int2byte = operator.methodcaller("to_bytes", 1, "big")
 
 BANNER = """\
   _____  _               _____            
@@ -450,6 +468,141 @@ class Cell:
             return True
         else:
             return False
+
+
+class Ed25519:
+    """
+    Python implementation of Ed25519, used by the NTOR handshake.
+    "Ed25519 is both a signature scheme and a use case for Edwards-form Curve25519."
+
+    References:
+        - https://ed25519.cr.yp.to/python/ed25519.py
+        - https://gitweb.torproject.org/tor.git/tree/src/test/ed25519_exts_ref.py
+        - https://monero.stackexchange.com/questions/9820/recursionerror-in-ed25519-py
+        - https://crypto.stackexchange.com/questions/47147/ed25519-is-a-signature-or-just-elliptic-curve
+        - https://github.com/Marten4n6/TinyTor/issues/3
+    """
+
+    def __init__(self):
+        self._b = 256
+        self._q = 2 ** 255 - 19
+        self._l = 2 ** 252 + 27742317777372353535851937790883648493
+
+        self._d = -121665 * self._inv(121666)
+        self._I = self._exp_mod(2, (self._q - 1) // 4, self._q)
+
+        self._By = 4 * self._inv(5)
+        self._Bx = self._x_recover(self._By)
+        self._B = [self._Bx % self._q, self._By % self._q]
+
+    @staticmethod
+    def _hash(m):
+        return hashlib.sha512(m).digest()
+
+    def _exp_mod(self, b, e, m):
+        if e == 0:
+            return 1
+        t = self._exp_mod(b, e // 2, m) ** 2 % m
+        if e & 1:
+            t = (t * b) % m
+        return t
+
+    def _inv(self, x):
+        return self._exp_mod(x, self._q - 2, self._q)
+
+    def _x_recover(self, y):
+        xx = (y * y - 1) * self._inv(self._d * y * y + 1)
+        x = self._exp_mod(xx, (self._q + 3) // 8, self._q)
+        if (x * x - xx) % self._q != 0:
+            x = (x * self._I) % self._q
+        if x % 2 != 0:
+            x = self._q - x
+        return x
+
+    def _edwards(self, P, Q):
+        x1 = P[0]
+        y1 = P[1]
+        x2 = Q[0]
+        y2 = Q[1]
+        x3 = (x1 * y2 + x2 * y1) * self._inv(1 + self._d * x1 * x2 * y1 * y2)
+        y3 = (y1 * y2 + x1 * x2) * self._inv(1 - self._d * x1 * x2 * y1 * y2)
+        return [x3 % self._q, y3 % self._q]
+
+    def _scalar_mult(self, P, e):
+        if e == 0:
+            return [0, 1]
+        Q = self._scalar_mult(P, e // 2)
+        Q = self._edwards(Q, Q)
+        if e & 1:
+            Q = self._edwards(Q, P)
+        return Q
+
+    def _encode_int(self, y):
+        bits = [(y >> i) & 1 for i in range(self._b)]
+        return b''.join([int2byte(sum([bits[i * 8 + j] << j for j in range(8)])) for i in range(self._b // 8)])
+
+    def _encode_point(self, P):
+        x = P[0]
+        y = P[1]
+        bits = [(y >> i) & 1 for i in range(self._b - 1)] + [x & 1]
+        return b''.join([int2byte(sum([bits[i * 8 + j] << j for j in range(8)])) for i in range(self._b // 8)])
+
+    @staticmethod
+    def _bit(h, i):
+        return (indexbytes(h, i // 8) >> (i % 8)) & 1
+
+    def public_key(self, sk):
+        h = self._hash(sk)
+        a = 2 ** (self._b - 2) + sum(2 ** i * self._bit(h, i) for i in range(3, self._b - 2))
+        A = self._scalar_mult(self._B, a)
+        return self._encode_point(A)
+
+    @staticmethod
+    def create_secret_key():
+        return urandom(32)
+
+    def _hint(self, m):
+        h = self._hash(m)
+        return sum(2 ** i * self._bit(h, i) for i in range(2 * self._b))
+
+    def signature(self, m, sk, pk):
+        h = self._hash(sk)
+        a = 2 ** (self._b - 2) + sum(2 ** i * self._bit(h, i) for i in range(3, self._b - 2))
+        r = self._hint(intlist2bytes([indexbytes(h, j) for j in range(self._b // 8, self._b // 4)]) + m)
+        R = self._scalar_mult(self._B, r)
+        S = (r + self._hint(self._encode_point(R) + pk + m) * a) % self._l
+        return self._encode_point(R) + self._encode_int(S)
+
+    def _is_on_curve(self, P):
+        x = P[0]
+        y = P[1]
+        return (-x * x + y * y - 1 - self._d * x * x * y * y) % self._q == 0
+
+    def _decode_int(self, s):
+        return sum(2 ** i * self._bit(s, i) for i in range(0, self._b))
+
+    def _decode_point(self, s):
+        y = sum(2 ** i * self._bit(s, i) for i in range(0, self._b - 1))
+        x = self._x_recover(y)
+        if x & 1 != self._bit(s, self._b - 1):
+            x = self._q - x
+        P = [x, y]
+        if not self._is_on_curve(P):
+            raise Exception("Decoding point that is not on curve.")
+
+        return P
+
+    def check_valid(self, s, m, pk):
+        if len(s) != self._b // 4:
+            raise Exception("Signature length is wrong.")
+        if len(pk) != self._b // 8:
+            raise Exception("Public-key length is wrong.")
+        R = self._decode_point(s[0:self._b // 8])
+        A = self._decode_point(pk)
+        S = self._decode_int(s[self._b // 8:self._b // 4])
+        h = self._hint(self._encode_point(R) + pk + m)
+        if self._scalar_mult(self._B, S) != self._edwards(R, self._scalar_mult(A, h)):
+            raise Exception("Signature does not pass verification.")
 
 
 class CircuitNode:
