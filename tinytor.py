@@ -331,7 +331,7 @@ class Cell:
         self.command = command
         self.payload = payload
 
-    def get_bytes(self, max_protocol_version=None):
+    def get_bytes(self, max_protocol_version=3):
         """The byte representation of this cell which can be written to a socket.
 
         :type max_protocol_version: int
@@ -376,13 +376,23 @@ class Cell:
         else:
             log.error("Invalid payload format for command: " + str(self.command))
 
-        if max_protocol_version and max_protocol_version >= 4:
-            # Link protocol 4 increases circuit ID width to 4 bytes.
-            header = struct.pack("!iBH", self.circuit_id, self.command, len(payload_bytes))
-        else:
-            header = struct.pack("!HBH", self.circuit_id, self.command, len(payload_bytes))
+        if self.is_variable_length_command(self.command):
+            if max_protocol_version < 4:
+                header = struct.pack("!HBH", self.circuit_id, self.command, len(payload_bytes))
+            else:
+                # Link protocol 4 increases circuit ID width to 4 bytes.
+                header = struct.pack("!IBH", self.circuit_id, self.command, len(payload_bytes))
 
-        return header + payload_bytes
+            return header + payload_bytes
+        else:
+            # This is a fixed-length cell.
+            if max_protocol_version < 4:
+                payload_bytes = struct.pack("!HB509s", self.circuit_id, self.command, payload_bytes)
+            else:
+                # Link protocol 4 increases circuit ID width to 4 bytes.
+                payload_bytes = struct.pack("!IB509s", self.circuit_id, self.command, payload_bytes)
+
+            return payload_bytes
 
     @staticmethod
     def is_variable_length_command(command):
