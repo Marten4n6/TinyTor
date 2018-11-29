@@ -15,6 +15,7 @@ from hashlib import sha256
 from os import path
 from sys import exit
 from zlib import compress
+from tinytor import __version__
 
 
 def convert_size(size_bytes):
@@ -89,26 +90,26 @@ def main():
                 modified_source += line
                 previous_line = line
 
-        encoded_and_compressed = compress(b64encode(modified_source.encode()))
+        compressed_and_encoded = b64encode(compress(modified_source.encode()))
 
         bytes_hash = sha256()
-        bytes_hash.update(encoded_and_compressed)
+        bytes_hash.update(compressed_and_encoded)
 
         print("[INFO] Old size: " + convert_size(path.getsize(source_path)))
-        print("[INFO] New size: " + convert_size(len(encoded_and_compressed)))
+        print("[INFO] New size: " + convert_size(len(compressed_and_encoded)))
         print("[INFO] Python code to dynamically load and use this library:")
 
         print("======== BEGIN PYTHON CODE ========")
         print("from base64 import b64decode")
         print("from zlib import decompress")
         print("")
-        print("# The following is a compressed version of TinyTor (https://github.com/Marten4n6/TinyTor).")
+        print("# This is a compressed version of TinyTor v%s (https://github.com/Marten4n6/TinyTor)." % __version__)
         print("# The source code which generated this is also available there.")
         print("# It's understandable that you wouldn't trust random bytes like this.")
-        print("# The SHA256 hash of the bytes is: " + bytes_hash.hexdigest())
-        print("tor = %s" % str(encoded_and_compressed))
+        print("# The SHA256 hash of these bytes is: " + bytes_hash.hexdigest())
+        print("tor = %s" % str(compressed_and_encoded))
         print("tor_dict = {}")
-        print("exec(b64decode(decompress(tor)), tor_dict)")
+        print("exec(decompress(b64decode(tor)), tor_dict)")
         print("")
         print("# Sends a HTTP request over Tor.")
         print('exec("tor = TinyTor()", tor_dict)')
