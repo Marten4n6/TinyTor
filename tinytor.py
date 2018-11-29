@@ -12,13 +12,11 @@ import random
 import socket
 import ssl
 import struct
-import subprocess
 import traceback
 from argparse import ArgumentParser
-from base64 import b64decode, b16encode
+from base64 import b64decode, b16encode, b16decode
 from os import urandom
 from sys import exit
-from textwrap import dedent
 from threading import Thread
 from time import time
 
@@ -33,8 +31,10 @@ try:
     range = xrange
     int2byte = chr
 
+
     def indexbytes(buf, i):
         return ord(buf[i])
+
 
     def intlist2bytes(l):
         return b"".join(chr(c) for c in l)
@@ -43,7 +43,6 @@ except NameError:
     indexbytes = operator.getitem
     intlist2bytes = bytes
     int2byte = operator.methodcaller("to_bytes", 1, "big")
-
 
 BANNER = """\
   _____  _               _____            
@@ -117,8 +116,6 @@ class OnionRouter:
             if line.startswith("ntor-onion-key "):
                 self.key_ntor = line.split("ntor-onion-key")[1].strip()
                 break
-
-        print("NNtor onion key: " + self.key_ntor)
 
     def __str__(self):
         return "OnionRouter(nickname=%s, ip=%s, dir_port=%s, tor_port=%s, fingerprint=%s, flags=%s, key_ntor=%s)" % (
@@ -541,8 +538,54 @@ class Ed25519:
             raise Exception("Signature does not pass verification.")
 
 
+class KeyAgreementNTOR:
+    """This class handles performing the NTOR handshake.
+
+    This handshake uses a set of DH handshakes to compute a set of
+    shared keys which the client knows are shared only with a particular
+    server, and the server knows are shared with whomever sent the
+    original handshake (or with nobody at all).  Here we use the
+    "curve25519" group and representation as specified in "Curve25519:
+    new Diffie-Hellman speed records" by D. J. Bernstein.
+
+    See tor-spec.txt 5.1.4. The "ntor" handshake
+    """
+
+    PROTOCOL_ID = "ntor-curve25519-sha256-1"
+    t_mac = PROTOCOL_ID + ":mac"
+    t_key = PROTOCOL_ID + ":key_extract"
+    t_verify = PROTOCOL_ID + ":verify"
+    m_expand = PROTOCOL_ID + ":key_expand"
+
+    def __init__(self, onion_router):
+        """:type onion_router: OnionRouter"""
+        self._onion_router = onion_router
+
+        # To perform the handshake, the client needs to know an identity key
+        # digest for the server, and an NTOR onion key (a curve25519 public-key) for that server.
+        # Call the NTOR onion key "B".
+        # The client generates a temporary keypair:
+        #   x,X = KEYGEN()
+        ed25519 = Ed25519()
+
+        self.x = ed25519.create_secret_key()
+        self.X = ed25519.get_public_key(self.x)
+
+    def get_private_key(self):
+        """:rtype: bytes"""
+        return self.x
+
+    def get_public_key(self):
+        """:rtype: bytes"""
+        return self.X
+
+
 class CircuitNode:
     """Represents an onion router in the circuit."""
+
+    ID_LENGTH = 20
+    H_LENGTH = 32
+    G_LENGTH = 32
 
     def __init__(self, circuit, onion_router):
         """
@@ -562,14 +605,28 @@ class CircuitNode:
 
     def create_onion_skin(self):
         """
-        The payload for a CREATE cell is an 'onion skin', which consists of
-        the first step of the DH handshake data (also known as g^x).  This
-        value is encrypted using the "legacy hybrid encryption" algorithm.
+        Client-side handshake contents:
+            NODEID      Server identity digest  [ID_LENGTH bytes]
+            KEYID       KEYID(B)                [H_LENGTH bytes]
+            CLIENT_PK   X                       [G_LENGTH bytes]
 
-        See tor-spec.txt 5.1.3. The "TAP" handshake
+        See tor-spec.txt 5.1.4. The "ntor" handshake
+
         :rtype: bytes
         """
-        pass
+        node_id = b16decode(self.get_onion_router().fingerprint.encode())
+        key_id = b64decode(self.get_onion_router().key_ntor.encode())
+        client_pk = KeyAgreementNTOR(self._onion_router).get_public_key()
+
+        # Validate length.
+        if len(node_id) != self.ID_LENGTH:
+            log.error("Invalid NODEID length.")
+        if len(key_id) != self.H_LENGTH:
+            log.error("Invalid KEYID length.")
+        if len(client_pk) != self.G_LENGTH:
+            log.error("Invalid CLIENT_PK length.")
+
+        return node_id + key_id + client_pk
 
 
 class Circuit:
@@ -600,7 +657,22 @@ class Circuit:
 
         See tor-spec.txt 5.1. "CREATE and CREATED cells"
         """
-        pass
+        log.debug("Performing NTOR handshake...")
+
+        circuit_node = CircuitNode(self, self._tor_socket.get_guard_relay())
+        onion_skin = circuit_node.create_onion_skin()
+
+        # NTOR onion skin length is 84
+        self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, [
+            2,
+            len(onion_skin),
+            onion_skin
+        ]))
+
+        log.debug("Waiting for handshake response...")
+        cell = self._tor_socket.retrieve_cell()
+
+        log.debug("Received: " + str(cell))
 
     def handle_cell(self, cell):
         """Handles a cell response related to this circuit, called by TorSocket.
@@ -630,7 +702,10 @@ class TorSocket:
         self._circuits = dict()
 
     def get_guard_relay(self):
-        """:return: The guard relay this socket is attached to."""
+        """
+        :return: The guard relay this socket is attached to.
+        :rtype: OnionRouter
+        """
         return self._guard_relay
 
     def connect(self):
