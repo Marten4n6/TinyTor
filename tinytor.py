@@ -13,7 +13,6 @@ import socket
 import ssl
 import struct
 import subprocess
-import sys
 import traceback
 from argparse import ArgumentParser
 from base64 import b64decode, b16encode
@@ -82,7 +81,7 @@ class DirectoryAuthority:
 class OnionRouter:
     """This class represents an onion router in a circuit.."""
 
-    def __init__(self, nickname, ip, dir_port, tor_port, fingerprint, flags=None, key_tap=None):
+    def __init__(self, nickname, ip, dir_port, tor_port, fingerprint, flags=None, key_ntor=None):
         """
         :type nickname: str
         :type ip: str
@@ -90,7 +89,7 @@ class OnionRouter:
         :type tor_port: int
         :type fingerprint: str
         :type flags: list
-        :type key_tap: bytes
+        :type key_ntor: str
         """
         self.nickname = nickname
         self.ip = ip
@@ -98,7 +97,7 @@ class OnionRouter:
         self.tor_port = tor_port
         self.fingerprint = fingerprint
         self.flags = flags
-        self.key_tap = key_tap
+        self.key_ntor = key_ntor
 
     def get_descriptor_url(self):
         """:return: The URL to the onion router's descriptor (where keys are stored)."""
@@ -112,81 +111,18 @@ class OnionRouter:
         request = Request(url=self.get_descriptor_url(), headers=headers)
         response = urlopen(request)
 
-        key_tap = ""
-        append_tap = False
-
         for line in response:
             line = line.decode()
 
-            if line.startswith("onion-key"):
-                append_tap = True
-                continue
+            if line.startswith("ntor-onion-key "):
+                self.key_ntor = line.split("ntor-onion-key")[1].strip()
+                break
 
-            if append_tap:
-                if "END RSA PUBLIC KEY" in line:
-                    key_tap += line.replace("\n", "")
-                    break
-                else:
-                    key_tap += line
-
-        # The openssl rsa command only works with PKCS#8 formatted public keys.
-        # "BEGIN RSA PUBLIC KEY" is PKCS#1, which can only contain RSA keys.
-        # "BEGIN PUBLIC KEY" is PKCS#8, which can contain a variety of formats.
-        # macOS / OSX doesn't support "-RSAPublicKey_in" for converting the keys (https://stackoverflow.com/a/27930720).
-        # So fuck it, we'll convert the key to the new format manually then.
-        self.key_tap = self._key_tap_to_der(key_tap)
-
-    @staticmethod
-    def _key_tap_to_der(key_tap):
-        """Converts a PKCS#1 key to PKCS#8 by building it manually using asn1parse.
-        This is where the magic happens and many hours were spent...
-
-        :type key_tap: str
-        :rtype: bytes
-        """
-        log.debug("Converting key to PKCS#8 DER...")
-
-        # Get the key's modulus and exponent via asn1parse.
-        out, err = subprocess.Popen("echo '%s' | openssl asn1parse -in /dev/stdin" % key_tap,
-                                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-        output = (out + err).decode()
-
-        modulus = output.split("\n")[1].split(" :")[1]
-        exponent = output.split("\n")[2].split(" :")[1]
-
-        # https://www.openssl.org/docs/man1.0.2/crypto/ASN1_generate_nconf.html
-        configuration = dedent("""\
-        # Start with a SEQUENCE
-        asn1=SEQUENCE:pubkeyinfo
-
-        # pubkeyinfo contains an algorithm identifier and the 
-        # public key wrapped in a BIT STRING
-        [pubkeyinfo]
-        algorithm=SEQUENCE:rsa_alg
-        pubkey=BITWRAP,SEQUENCE:rsapubkey
-
-        # algorithm ID for RSA is just an OID and a NULL
-        [rsa_alg]
-        algorithm=OID:rsaEncryption
-        parameter=NULL
-
-        # Actual public key: modulus and exponent
-        [rsapubkey]
-        n=INTEGER:0x%s
-
-        e=INTEGER:0x%s
-        """ % (modulus, exponent))
-
-        # Generate the public key and output in DER (bytes) format.
-        out, err = subprocess.Popen("echo '%s' | openssl asn1parse -genconf /dev/stdin -noout -out /dev/stdout"
-                                    % configuration, shell=True,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-
-        return out + err
+        print("NNtor onion key: " + self.key_ntor)
 
     def __str__(self):
-        return "OnionRouter(nickname=%s, ip=%s, dir_port=%s, tor_port=%s, fingerprint=%s, flags=%s, key_tap=%s)" % (
-            self.nickname, self.ip, self.dir_port, self.tor_port, self.fingerprint, self.flags, self.key_tap
+        return "OnionRouter(nickname=%s, ip=%s, dir_port=%s, tor_port=%s, fingerprint=%s, flags=%s, key_ntor=%s)" % (
+            self.nickname, self.ip, self.dir_port, self.tor_port, self.fingerprint, self.flags, self.key_ntor
         )
 
 
@@ -551,7 +487,7 @@ class Ed25519:
     def _bit(h, i):
         return (indexbytes(h, i // 8) >> (i % 8)) & 1
 
-    def public_key(self, sk):
+    def get_public_key(self, sk):
         h = self._hash(sk)
         a = 2 ** (self._b - 2) + sum(2 ** i * self._bit(h, i) for i in range(3, self._b - 2))
         A = self._scalar_mult(self._B, a)
@@ -929,10 +865,10 @@ class TinyTor:
                 traceback.print_exc()
                 log.info("Retrying with a different guard relay...")
 
-        # Start communicating with the guard relay.
-        tor_socket = TorSocket(guard_relay)
-
         try:
+            # Start communicating with the guard relay.
+            tor_socket = TorSocket(guard_relay)
+
             tor_socket.connect()
             tor_socket.create_circuit()
         except Exception as ex:
