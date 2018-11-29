@@ -29,22 +29,22 @@ except ImportError:
     # Python2 support.
     from urllib2 import Request, urlopen
 
-# Set up byte handling for Python 2 or 3.
-if sys.version_info.major == 2:
-    int2byte = chr
+try:
+    # Set up byte handling for python2.
     range = xrange
-
+    int2byte = chr
 
     def indexbytes(buf, i):
         return ord(buf[i])
 
-
     def intlist2bytes(l):
         return b"".join(chr(c) for c in l)
-else:
+except NameError:
+    # xrange doesn't exist in python3.
     indexbytes = operator.getitem
     intlist2bytes = bytes
     int2byte = operator.methodcaller("to_bytes", 1, "big")
+
 
 BANNER = """\
   _____  _               _____            
