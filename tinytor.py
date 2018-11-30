@@ -331,7 +331,7 @@ class Cell:
         self.command = command
         self.payload = payload
 
-    def get_bytes(self, max_protocol_version=3):
+    def get_bytes(self, max_protocol_version):
         """The byte representation of this cell which can be written to a socket.
 
         :type max_protocol_version: int
@@ -672,7 +672,6 @@ class Circuit:
         circuit_node = CircuitNode(self, self._tor_socket.get_guard_relay())
         onion_skin = circuit_node.create_onion_skin()
 
-        # NTOR onion skin length is 84
         self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, [
             2,
             len(onion_skin),
@@ -681,8 +680,6 @@ class Circuit:
 
         log.debug("Waiting for handshake response...")
         cell = self._tor_socket.retrieve_cell()
-
-        log.debug("Received: " + str(cell))
 
     def handle_cell(self, cell):
         """Handles a cell response related to this circuit, called by TorSocket.
@@ -703,10 +700,11 @@ class TorSocket:
         # "TLS_DHE_RSA_WITH_AES_128_CBC_SHA" if it is available.
         self._socket = ssl.wrap_socket(
             socket.socket(socket.AF_INET, socket.SOCK_STREAM),
-            ssl_version=ssl.PROTOCOL_SSLv23
+            ssl_version=ssl.PROTOCOL_TLSv1_2
         )
-        self._protocol_versions = None
+        self._protocol_versions = [3]
         self._our_public_ip = "0"
+        self._shutdown_requested = False
 
         # Dictionary of circuits this socket is attached to (key = circuit's ID).
         self._circuits = dict()
@@ -740,8 +738,10 @@ class TorSocket:
         self._retrieve_net_info()
         self._send_net_info()
 
-        receive_cell_loop = Thread(target=self._receive_cell_loop)
-        receive_cell_loop.start()
+    def close(self):
+        """Closes the tor socket (and circuit)."""
+        self._shutdown_requested = True
+        self._socket.close()
 
     def create_circuit(self):
         """Creates a path to the final destination."""
@@ -756,10 +756,7 @@ class TorSocket:
 
         :type cell: Cell
         """
-        if self._protocol_versions:
-            self._socket.write(cell.get_bytes(max(self._protocol_versions)))
-        else:
-            self._socket.write(cell.get_bytes())
+        self._socket.write(cell.get_bytes(max(self._protocol_versions)))
 
     def retrieve_cell(self, ignore_response=False):
         """Waits for a cell response then parses it into a Cell object.
@@ -768,11 +765,11 @@ class TorSocket:
         """
         # https://docs.python.org/3/library/struct.html
 
-        # Link protocol 4 increases circuit ID width to 4 bytes.
-        if self._protocol_versions and max(self._protocol_versions) >= 4:
-            circuit_id = struct.unpack("!i", self._socket.read(4))[0]
-        else:
+        if max(self._protocol_versions) < 4:
             circuit_id = struct.unpack("!H", self._socket.read(2))[0]
+        else:
+            # Link protocol 4 increases circuit ID width to 4 bytes.
+            circuit_id = struct.unpack("!I", self._socket.read(4))[0]
 
         command = struct.unpack("!B", self._socket.read(1))[0]
 
@@ -823,6 +820,10 @@ class TorSocket:
         log.debug("Starting cell receive loop...")
 
         while True:
+            if self._shutdown_requested:
+                log.debug("Shutting down cell receive loop...")
+                break
+
             cell = self.retrieve_cell()
 
             self._circuits[cell.circuit_id].handle(cell)
@@ -950,15 +951,17 @@ class TinyTor:
                 traceback.print_exc()
                 log.info("Retrying with a different guard relay...")
 
-        try:
-            # Start communicating with the guard relay.
-            tor_socket = TorSocket(guard_relay)
+        # Start communicating with the guard relay.
+        tor_socket = TorSocket(guard_relay)
 
+        try:
             tor_socket.connect()
             tor_socket.create_circuit()
         except Exception as ex:
             traceback.print_exc()
             log.info("Retrying to perform HTTP request...")
+
+            tor_socket.close()
             self.http_get(url)
 
         return "TINYTOR_IMPLEMENTATION_IS_NOT_FINISHED"
