@@ -642,14 +642,12 @@ class CircuitNode:
 class Circuit:
     """Handles circuit management."""
 
-    _CIRCUIT_COUNT = 0
-
     def __init__(self, tor_socket):
         """
         :type tor_socket: TorSocket
         """
         self._tor_socket = tor_socket
-        self._circuit_id = Circuit._CIRCUIT_COUNT + 1
+        self._circuit_id = random.randint(2 ** 31, 2 ** 31)  # C int value range (4 bytes)
 
     def get_circuit_id(self):
         """:rtype: int"""
