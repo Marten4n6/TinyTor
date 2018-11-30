@@ -90,10 +90,10 @@ def main():
                 modified_source += line
                 previous_line = line
 
-        compressed_and_encoded = b64encode(compress(modified_source.encode()))
+        compressed_and_encoded = b64encode(compress(modified_source.encode())).decode()
 
         bytes_hash = sha256()
-        bytes_hash.update(compressed_and_encoded)
+        bytes_hash.update(compressed_and_encoded.encode())
 
         print("[INFO] Old size: " + convert_size(path.getsize(source_path)))
         print("[INFO] New size: " + convert_size(len(compressed_and_encoded)))
@@ -105,9 +105,9 @@ def main():
         print("")
         print("# This is a compressed version of TinyTor v%s (https://github.com/Marten4n6/TinyTor)." % __version__)
         print("# The source code which generated this is also available there.")
-        print("# It's understandable that you wouldn't trust random bytes like this.")
-        print("# The SHA256 hash of these bytes is: " + bytes_hash.hexdigest())
-        print("tor = %s" % str(compressed_and_encoded))
+        print("# It's understandable that you wouldn't trust a random string like this.")
+        print("# The SHA256 hash of this string is: " + bytes_hash.hexdigest())
+        print("tor = \"%s\"" % compressed_and_encoded)
         print("tor_dict = {}")
         print("exec(decompress(b64decode(tor)), tor_dict)")
         print("")
