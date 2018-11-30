@@ -48,7 +48,10 @@ def main():
         middle_of_docstring = False
 
         for line in input_file:
-            if line.strip().startswith("# "):
+            if line.strip().startswith("def main():"):
+                # Skip everything under this, we won't be using it from the command line.
+                break
+            elif line.strip().startswith("# "):
                 # Strip out comments.
                 # print("[DEBUG] Skipping: " + line.replace("\n", ""))
                 continue
