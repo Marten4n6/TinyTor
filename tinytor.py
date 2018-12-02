@@ -6,6 +6,7 @@ __license__ = "GPLv3"
 __version__ = "0.0.1"
 
 import hashlib
+import hmac
 import logging
 import operator
 import random
@@ -17,7 +18,6 @@ from argparse import ArgumentParser
 from base64 import b64decode, b16encode, b16decode
 from os import urandom
 from sys import exit
-from threading import Thread
 from time import time
 
 try:
@@ -80,7 +80,7 @@ class DirectoryAuthority:
 class OnionRouter:
     """This class represents an onion router in a circuit.."""
 
-    def __init__(self, nickname, ip, dir_port, tor_port, fingerprint, flags=None, key_ntor=None):
+    def __init__(self, nickname, ip, dir_port, tor_port, fingerprint, flags=None, key_ntor=None, shared_key=None):
         """
         :type nickname: str
         :type ip: str
@@ -97,6 +97,7 @@ class OnionRouter:
         self.fingerprint = fingerprint
         self.flags = flags
         self.key_ntor = key_ntor
+        self.shared_key = shared_key
 
     def get_descriptor_url(self):
         """:return: The URL to the onion router's descriptor (where keys are stored)."""
@@ -108,7 +109,7 @@ class OnionRouter:
             "User-Agent": "Mozilla/5.0 (Windows NT 6.1; rv:60.0) Gecko/20100101 Firefox/60.0"
         }
         request = Request(url=self.get_descriptor_url(), headers=headers)
-        response = urlopen(request)
+        response = urlopen(request, timeout=8)
 
         for line in response:
             line = line.decode()
@@ -427,6 +428,9 @@ class Ed25519:
     """
 
     def __init__(self):
+        self._P = 2 ** 255 - 19
+        self._A = 486662
+
         self._b = 256
         self._q = 2 ** 255 - 19
         self._l = 2 ** 252 + 27742317777372353535851937790883648493
@@ -451,7 +455,7 @@ class Ed25519:
         return t
 
     def _inv(self, x):
-        return self._exp_mod(x, self._q - 2, self._q)
+        return self._exp_mod(x, self._P - 2, self._P)
 
     def _x_recover(self, y):
         xx = (y * y - 1) * self._inv(self._d * y * y + 1)
@@ -495,10 +499,8 @@ class Ed25519:
         return (indexbytes(h, i // 8) >> (i % 8)) & 1
 
     def get_public_key(self, sk):
-        h = self._hash(sk)
-        a = 2 ** (self._b - 2) + sum(2 ** i * self._bit(h, i) for i in range(3, self._b - 2))
-        A = self._scalar_mult(self._B, a)
-        return self._encode_point(A)
+        sk = self.clamp(self.unpack(sk))
+        return self.pack(self.exp(sk, 9))
 
     @staticmethod
     def create_secret_key():
@@ -547,96 +549,183 @@ class Ed25519:
         if self._scalar_mult(self._B, S) != self._edwards(R, self._scalar_mult(A, h)):
             raise Exception("Signature does not pass verification.")
 
+    # Addition and doubling formulas taken from Appendix D of "Curve25519:
+    # new Diffie-Hellman speed records".
+    def add(self, n, m, d):
+        (xn, zn), (xm, zm), (xd, zd) = n, m, d
+        x = 4 * (xm * xn - zm * zn) ** 2 * zd
+        z = 4 * (xm * zn - zm * xn) ** 2 * xd
+        return x % self._P, z % self._P
+
+    def double(self, n):
+        (xn, zn) = n
+        x = (xn ** 2 - zn ** 2) ** 2
+        z = 4 * xn * zn * (xn ** 2 + self._A * xn * zn + zn ** 2)
+        return x % self._P, z % self._P
+
+    def exp(self, n, base):
+        one = (base, 1)
+        two = self.double(one)
+
+        # f(m) evaluates to a tuple containing the mth multiple and the
+        # (m+1)th multiple of base.
+        def f(m):
+            if m == 1:
+                return one, two
+            (pm, pm1) = f(m // 2)
+            if m & 1:
+                return self.add(pm, pm1, one), self.double(pm1)
+            return self.double(pm), self.add(pm, pm1, one)
+
+        ((x, z), _) = f(n)
+        return (x * self._inv(z)) % self._P
+
+    def b2i(self, c):
+        return c
+
+    def i2b(self, i):
+        return i
+
+    def ba2bs(self, ba):
+        return bytes(ba)
+
+    def clamp(self, n):
+        n &= ~7
+        n &= ~(128 << 8 * 31)
+        n |= 64 << 8 * 31
+        return n
+
+    def unpack(self, s):
+        if len(s) != 32:
+            raise ValueError("Invalid Curve25519 argument.")
+        return sum(self.b2i(s[i]) << (8 * i) for i in range(32))
+
+    def pack(self, n):
+        return self.ba2bs([self.i2b((n >> (8 * i)) & 255) for i in range(32)])
+
+    def smult_curve25519(self, n, p):
+        n = self.clamp(self.unpack(n))
+        p = self.unpack(p)
+        return self.pack(self.exp(n, p))
+
 
 class KeyAgreementNTOR:
-    """This class handles performing the NTOR handshake.
-
-    This handshake uses a set of DH handshakes to compute a set of
-    shared keys which the client knows are shared only with a particular
-    server, and the server knows are shared with whomever sent the
-    original handshake (or with nobody at all).  Here we use the
-    "curve25519" group and representation as specified in "Curve25519:
-    new Diffie-Hellman speed records" by D. J. Bernstein.
-
-    See tor-spec.txt 5.1.4. The "ntor" handshake
-    """
-
-    PROTOCOL_ID = "ntor-curve25519-sha256-1"
-    t_mac = PROTOCOL_ID + ":mac"
-    t_key = PROTOCOL_ID + ":key_extract"
-    t_verify = PROTOCOL_ID + ":verify"
-    m_expand = PROTOCOL_ID + ":key_expand"
-
     def __init__(self, onion_router):
-        """:type onion_router: OnionRouter"""
+        """:type onion_router: OnionRouter
+
+        In this section, define:
+            H(x,t) as HMAC_SHA256 with message x and key t.
+            H_LENGTH  = 32.
+            ID_LENGTH = 20.
+            G_LENGTH  = 32
+            PROTOID   = "ntor-curve25519-sha256-1"
+            t_mac     = PROTOID | ":mac"
+            t_key     = PROTOID | ":key_extract"
+            t_verify  = PROTOID | ":verify"
+            MULT(a,b) = the multiplication of the curve25519 point 'a' by the
+                        scalar 'b'.
+            G         = The preferred base point for curve25519 ([9])
+            KEYGEN()  = The curve25519 key generation algorithm, returning
+                        a private/public keypair.
+            m_expand  = PROTOID | ":key_expand"
+            KEYID(A)  = A
+
+        H is defined as hmac()
+        MULT is included in the curve25519 library as get_shared_key()
+        KEYGEN() is curve25519.Private()
+        """
         self._onion_router = onion_router
+
+        self._PROTOCOL_ID = b'ntor-curve25519-sha256-1'
+        self._t_mac = self._PROTOCOL_ID + b':mac'
+        self._t_key = self._PROTOCOL_ID + b':key_extract'
+        self._t_verify = self._PROTOCOL_ID + b':verify'
+        self._m_expand = self._PROTOCOL_ID + b':key_expand'
 
         # To perform the handshake, the client needs to know an identity key
-        # digest for the server, and an NTOR onion key (a curve25519 public-key) for that server.
-        # Call the NTOR onion key "B".
-        # The client generates a temporary keypair:
-        #   x,X = KEYGEN()
-        ed25519 = Ed25519()
+        # digest for the server, and an ntor onion key (a curve25519 public
+        # key) for that server. Call the ntor onion key "B".  The client
+        # generates a temporary keypair:
+        #     x,X = KEYGEN()
+        self._ed25519 = Ed25519()
+        self._x = self._ed25519.create_secret_key()
+        self._X = self._ed25519.get_public_key(self._x)
 
-        self.x = ed25519.create_secret_key()
-        self.X = ed25519.get_public_key(self.x)
+        self._B = b64decode(self._onion_router.key_ntor.encode())
 
-    def get_private_key(self):
-        """:rtype: bytes"""
-        return self.x
+        # and generates a client-side handshake with contents:
+        #     NODEID      Server identity digest  [ID_LENGTH bytes]
+        #     KEYID       KEYID(B)                [H_LENGTH bytes]
+        #     CLIENT_PK   X                       [G_LENGTH bytes]
+        self._handshake = b16decode(self._onion_router.fingerprint.encode())
+        self._handshake += self._B
+        self._handshake += self._X
 
-    def get_public_key(self):
-        """:rtype: bytes"""
-        return self.X
+    def get_handshake(self):
+        return self._handshake
 
+    @staticmethod
+    def _hmac(key, msg):
+        h = hmac.HMAC(key, digestmod=hashlib.sha256)
+        h.update(msg)
+        return h.digest()
 
-class CircuitNode:
-    """Represents an onion router in the circuit."""
+    def _kdf_rfc5869(self, key, salt, info, n):
+        prk = self._hmac(salt, key)
+        out = b""
+        last = b""
+        i = 1
+        while len(out) < n:
+            m = last + info + int2byte(i)
+            last = h = self._hmac(prk, m)
+            out += h
+            i = i + 1
+        return out[:n]
 
-    ID_LENGTH = 20
-    H_LENGTH = 32
-    G_LENGTH = 32
+    def _kdf_ntor(self, key, n):
+        return self._kdf_rfc5869(key, self._t_key, self._m_expand, n)
 
-    def __init__(self, circuit, onion_router):
+    def complete_handshake(self, Y, auth):
         """
-        :type circuit: Circuit
-        :type onion_router: OnionRouter
+        The server's handshake reply is:
+            SERVER_PK   Y                       [G_LENGTH bytes]
+            AUTH        H(auth_input, t_mac)    [H_LENGTH bytes]
         """
-        self._circuit = circuit
-        self._onion_router = onion_router
+        # The client then checks Y is in G^* [see NOTE below], and computes
+        # secret_input = EXP(Y,x) | EXP(B,x) | ID | B | X | Y | PROTOID
+        secret_input = self._ed25519.smult_curve25519(self._x, Y)
+        secret_input += self._ed25519.smult_curve25519(self._x, self._B)
+        secret_input += b16decode(self._onion_router.fingerprint.encode())
+        secret_input += self._B
+        secret_input += self._X
+        secret_input += Y
+        secret_input += b'ntor-curve25519-sha256-1'
 
-    def get_onion_router(self):
-        """:rtype: OnionRouter"""
-        return self._onion_router
+        # KEY_SEED = H(secret_input, t_key)
+        # verify = H(secret_input, t_verify)
+        key_seed = self._hmac(self._t_key, secret_input)
+        verify = self._hmac(self._t_verify, secret_input)
 
-    def get_circuit(self):
-        """:return: The circuit this node belongs to."""
-        return self._circuit
+        # auth_input = verify | ID | B | Y | X | PROTOID | "Server"
+        auth_input = verify
+        auth_input += b16decode(self._onion_router.fingerprint.encode())
+        auth_input += self._B
+        auth_input += Y
+        auth_input += self._X
+        auth_input += self._PROTOCOL_ID
+        auth_input += b'Server'
 
-    def create_onion_skin(self):
-        """
-        Client-side handshake contents:
-            NODEID      Server identity digest  [ID_LENGTH bytes]
-            KEYID       KEYID(B)                [H_LENGTH bytes]
-            CLIENT_PK   X                       [G_LENGTH bytes]
+        # The client verifies that AUTH == H(auth_input, t_mac).
+        if auth != self._hmac(self._t_mac, auth_input):
+            log.error("Server handshake doesn't match verification")
+            raise Exception("Server handshake doesn't match verificaiton.")
 
-        See tor-spec.txt 5.1.4. The "ntor" handshake
+        log.debug("Handshake verified, onion router's shared secret has been set.")
 
-        :rtype: bytes
-        """
-        node_id = b16decode(self.get_onion_router().fingerprint.encode())
-        key_id = b64decode(self.get_onion_router().key_ntor.encode())
-        client_pk = KeyAgreementNTOR(self._onion_router).get_public_key()
-
-        # Validate length.
-        if len(node_id) != self.ID_LENGTH:
-            log.error("Invalid NODEID length.")
-        if len(key_id) != self.H_LENGTH:
-            log.error("Invalid KEYID length.")
-        if len(client_pk) != self.G_LENGTH:
-            log.error("Invalid CLIENT_PK length.")
-
-        return node_id + key_id + client_pk
+        # Both parties now have a shared value for KEY_SEED.  They expand this
+        # into the keys needed for the Tor relay protocol, using the KDF
+        # described in 5.2.2 and the tag m_expand.
+        self._onion_router.shared_key = self._kdf_ntor(secret_input, 72)
 
 
 class Circuit:
@@ -667,17 +756,23 @@ class Circuit:
         """
         log.debug("Performing NTOR handshake...")
 
-        circuit_node = CircuitNode(self, self._tor_socket.get_guard_relay())
-        onion_skin = circuit_node.create_onion_skin()
+        ntor = KeyAgreementNTOR(self._tor_socket.get_guard_relay())
 
         self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, [
-            2,
-            len(onion_skin),
-            onion_skin
+            0x0002,
+            len(ntor.get_handshake()),
+            ntor.get_handshake()
         ]))
 
-        log.debug("Waiting for handshake response...")
+        log.debug("Waiting for response...")
+
         cell = self._tor_socket.retrieve_cell()
+
+        log.debug("Verifying response...")
+
+        _, Y, auth = struct.unpack("!H32s32s", cell.payload[:66])
+
+        ntor.complete_handshake(Y, auth)
 
     def handle_cell(self, cell):
         """Handles a cell response related to this circuit, called by TorSocket.
@@ -694,8 +789,6 @@ class TorSocket:
         """:type guard_relay: OnionRouter"""
         self._guard_relay = guard_relay
 
-        # All implementations MUST support the SSLv3 cipher suite
-        # "TLS_DHE_RSA_WITH_AES_128_CBC_SHA" if it is available.
         self._socket = ssl.wrap_socket(
             socket.socket(socket.AF_INET, socket.SOCK_STREAM),
             ssl_version=ssl.PROTOCOL_TLSv1_2
