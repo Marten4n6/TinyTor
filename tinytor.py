@@ -13,6 +13,8 @@ import socket
 import ssl
 import struct
 import traceback
+import hmac
+
 from argparse import ArgumentParser
 from base64 import b64decode, b16encode, b16decode
 from os import urandom
@@ -413,6 +415,106 @@ class Cell:
             return False
 
 
+P = 2 ** 255 - 19
+A = 486662
+
+def expmod(b, e, m):
+    if e == 0: return 1
+    t = expmod(b, e // 2, m) ** 2 % m
+    if e & 1: t = (t * b) % m
+    return t
+
+def inv(x):
+    return expmod(x, P - 2, P)
+
+# Addition and doubling formulas taken from Appendix D of "Curve25519:
+# new Diffie-Hellman speed records".
+
+def add(n,m,d):
+    (xn,zn), (xm,zm), (xd,zd) = n, m, d
+    x = 4 * (xm * xn - zm * zn) ** 2 * zd
+    z = 4 * (xm * zn - zm * xn) ** 2 * xd
+    return (x % P, z % P)
+
+def double(n):
+    (xn,zn) = n
+    x = (xn ** 2 - zn ** 2) ** 2
+    z = 4 * xn * zn * (xn ** 2 + A * xn * zn + zn ** 2)
+    return (x % P, z % P)
+
+def exp(n, base):
+    one = (base,1)
+    two = double(one)
+    # f(m) evaluates to a tuple containing the mth multiple and the
+    # (m+1)th multiple of base.
+    def f(m):
+        if m == 1: return (one, two)
+        (pm, pm1) = f(m // 2)
+        if (m & 1):
+            return (add(pm, pm1, one), double(pm1))
+        return (double(pm), add(pm, pm1, one))
+    ((x,z), _) = f(n)
+    return (x * inv(z)) % P
+
+def b2i(c):
+    return c
+def i2b(i):
+    return i
+def ba2bs(ba):
+    return bytes(ba)
+
+def clamp(n):
+  n &= ~7
+  n &= ~(128 << 8 * 31)
+  n |= 64 << 8 * 31
+  return n
+
+def unpack(s):
+  if len(s) != 32: raise ValueError('Invalid Curve25519 argument')
+  return sum(b2i(s[i]) << (8 * i) for i in range(32))
+
+def pack(n):
+  return ba2bs([i2b((n >> (8 * i)) & 255) for i in range(32)])
+
+def smult_curve25519(n, p):
+  n = clamp(unpack(n))
+  p = unpack(p)
+  return pack(exp(n, p))
+
+def HMAC(key,msg):
+    "Return the HMAC-SHA256 of 'msg' using the key 'key'."
+    H = hmac.new(key, b"", hashlib.sha256)
+    H.update(msg)
+    return H.digest()
+
+def H(msg,tweak):
+    """Return the hash of 'msg' using tweak 'tweak'.  (In this version of ntor,
+       the tweaked hash is just HMAC with the tweak as the key.)"""
+    return HMAC(key=tweak,  msg=msg)
+
+def bad_result(r):
+    """Helper: given a result of multiplying a public key by a private key,
+       return True iff one of the inputs was broken"""
+    assert len(r) == 32
+    return r == '\x00'*32
+
+def  kdf_rfc5869(key, salt, info, n):
+
+    prk = HMAC(key=salt, msg=key)
+
+    out = b""
+    last = b""
+    i = 1
+    while len(out) < n:
+        m = last + info + int2byte(i)
+        last = h = HMAC(key=prk, msg=m)
+        out += h
+        i = i + 1
+    return out[:n]
+
+def kdf_ntor(key, n):
+    return kdf_rfc5869(key, t_key, m_expand, n)
+
 class Ed25519:
     """
     Python implementation of Ed25519, used by the NTOR handshake.
@@ -495,10 +597,8 @@ class Ed25519:
         return (indexbytes(h, i // 8) >> (i % 8)) & 1
 
     def get_public_key(self, sk):
-        h = self._hash(sk)
-        a = 2 ** (self._b - 2) + sum(2 ** i * self._bit(h, i) for i in range(3, self._b - 2))
-        A = self._scalar_mult(self._B, a)
-        return self._encode_point(A)
+        sk = clamp(unpack(sk))
+        return pack(exp(sk, 9))
 
     @staticmethod
     def create_secret_key():
@@ -548,6 +648,12 @@ class Ed25519:
             raise Exception("Signature does not pass verification.")
 
 
+PROTOCOL_ID = b"ntor-curve25519-sha256-1"
+t_mac = PROTOCOL_ID + b":mac"
+t_key = PROTOCOL_ID + b":key_extract"
+t_verify = PROTOCOL_ID + b":verify"
+m_expand = PROTOCOL_ID + b":key_expand"
+
 class KeyAgreementNTOR:
     """This class handles performing the NTOR handshake.
 
@@ -560,12 +666,6 @@ class KeyAgreementNTOR:
 
     See tor-spec.txt 5.1.4. The "ntor" handshake
     """
-
-    PROTOCOL_ID = "ntor-curve25519-sha256-1"
-    t_mac = PROTOCOL_ID + ":mac"
-    t_key = PROTOCOL_ID + ":key_extract"
-    t_verify = PROTOCOL_ID + ":verify"
-    m_expand = PROTOCOL_ID + ":key_expand"
 
     def __init__(self, onion_router):
         """:type onion_router: OnionRouter"""
@@ -589,6 +689,14 @@ class KeyAgreementNTOR:
         """:rtype: bytes"""
         return self.X
 
+    @staticmethod
+    def H_mac(msg): 
+        return H(msg, tweak=t_mac)
+
+    @staticmethod
+    def H_verify(msg): 
+        return H(msg, tweak=t_verify)
+
 
 class CircuitNode:
     """Represents an onion router in the circuit."""
@@ -604,6 +712,16 @@ class CircuitNode:
         """
         self._circuit = circuit
         self._onion_router = onion_router
+        self._key = KeyAgreementNTOR(self._onion_router);
+        self._shared_key = None
+        self._node_id = b16decode(self.get_onion_router().fingerprint.encode())
+        self._key_id = b64decode(self.get_onion_router().key_ntor.encode())
+        self._client_pk = self._key.get_public_key()
+        # Validate length.
+        if len(self._node_id) != self.ID_LENGTH:  log.error("Invalid NODEID length.")
+        if len(self._key_id) != self.H_LENGTH:    log.error("Invalid KEYID length.")
+        if len(self._client_pk) != self.G_LENGTH: log.error("Invalid CLIENT_PK length.")
+
 
     def get_onion_router(self):
         """:rtype: OnionRouter"""
@@ -624,19 +742,28 @@ class CircuitNode:
 
         :rtype: bytes
         """
-        node_id = b16decode(self.get_onion_router().fingerprint.encode())
-        key_id = b64decode(self.get_onion_router().key_ntor.encode())
-        client_pk = KeyAgreementNTOR(self._onion_router).get_public_key()
+        return self._node_id + self._key_id + self._client_pk
 
-        # Validate length.
-        if len(node_id) != self.ID_LENGTH:
-            log.error("Invalid NODEID length.")
-        if len(key_id) != self.H_LENGTH:
-            log.error("Invalid KEYID length.")
-        if len(client_pk) != self.G_LENGTH:
-            log.error("Invalid CLIENT_PK length.")
+    def calculate_shared_key(self, cell):
+        server_pk = cell.payload["server_pk"]
+        their_auth= cell.payload["their_auth"]
 
-        return node_id + key_id + client_pk
+        client_k = self._key.get_private_key()
+
+        yx = smult_curve25519(client_k, server_pk)
+        bx = smult_curve25519(client_k, self._key_id)
+
+        secret_input = yx + bx + self._node_id + self._key_id + self._client_pk + server_pk + PROTOCOL_ID
+        verify = KeyAgreementNTOR.H_verify(secret_input)
+        my_auth = KeyAgreementNTOR.H_mac(verify + self._node_id + self._key_id + server_pk + self._client_pk + PROTOCOL_ID +  b"Server")
+
+        badness = my_auth != their_auth
+        badness |= bad_result(yx) + bad_result(bx)
+
+        if badness:
+            return None
+
+        self._shared_key = kdf_ntor(secret_input, 72)
 
 
 class Circuit:
@@ -678,6 +805,8 @@ class Circuit:
 
         log.debug("Waiting for handshake response...")
         cell = self._tor_socket.retrieve_cell()
+
+        circuit_node.calculate_shared_key(cell)
 
     def handle_cell(self, cell):
         """Handles a cell response related to this circuit, called by TorSocket.
@@ -805,6 +934,13 @@ class TorSocket:
                 our_address = socket.inet_ntoa(payload[6:][:our_address_length])
 
                 return Cell(circuit_id, command, [our_address])
+            elif command == CommandType.CREATED2:
+                hlen = struct.unpack("!H", payload[:2])[0]
+                hdata= payload[2:hlen+2]
+                server_pk = hdata[:32]
+                their_auth = hdata[32:]
+
+                return Cell(circuit_id, command, {'server_pk':server_pk, 'their_auth':their_auth})
             else:
                 log.debug("===== START UNKNOWN CELL =====")
                 log.debug("Circuit ID: " + str(circuit_id))
