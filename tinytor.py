@@ -21,10 +21,10 @@ from sys import exit
 from time import time
 
 try:
-    from urllib.request import Request, urlopen
+    from urllib.request import Request, urlopen, HTTPError
 except ImportError:
     # Python2 support.
-    from urllib2 import Request, urlopen
+    from urllib2 import Request, urlopen, HTTPError
 
 try:
     # Set up byte handling for python2.
@@ -100,11 +100,14 @@ class OnionRouter:
         self.shared_key = shared_key
 
     def get_descriptor_url(self):
-        """:return: The URL to the onion router's descriptor (where keys are stored)."""
+        """
+        :return: The URL to the onion router's descriptor (where keys are stored).
+        :rtype: str
+        """
         return "http://%s:%s/tor/server/fp/%s" % (self.ip, self.dir_port, self.fingerprint)
 
     def parse_descriptor(self):
-        """Updates the onion router's keys."""
+        """Updates the onion router's keys, may raise HTTPError."""
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 6.1; rv:60.0) Gecko/20100101 Firefox/60.0"
         }
@@ -118,11 +121,6 @@ class OnionRouter:
                 self.key_ntor = line.split("ntor-onion-key")[1].strip()
                 break
 
-    def __str__(self):
-        return "OnionRouter(nickname=%s, ip=%s, dir_port=%s, tor_port=%s, fingerprint=%s, flags=%s, key_ntor=%s)" % (
-            self.nickname, self.ip, self.dir_port, self.tor_port, self.fingerprint, self.flags, self.key_ntor
-        )
-
 
 class Consensus:
     """
@@ -133,11 +131,11 @@ class Consensus:
     The status of all the Tor relays is maintained in a living document called the consensus.
     DA’s maintain this document and update it every hour by a vote.
 
-    https://jordan-wright.com/blog/2015/05/14/how-tor-works-part-three-the-consensus/
+    See https://jordan-wright.com/blog/2015/05/14/how-tor-works-part-three-the-consensus/
     """
 
     def __init__(self):
-        # Taken from: https://consensus-health.torproject.org/
+        # Taken from https://consensus-health.torproject.org/
         self._directory_authorities = [
             DirectoryAuthority("maatuska", "171.25.193.9", 443, 80),
             DirectoryAuthority("tor26", "86.59.21.38", 80, 443),
@@ -159,7 +157,7 @@ class Consensus:
         return random.choice(self._directory_authorities)
 
     def parse_consensus(self, consensus_url, limit=200):
-        """Parses the consensus document into a list of onion routers.
+        """Parses the consensus document into a list of onion routers, may raise HTTPError.
 
         :type consensus_url: str
         :type limit: int
@@ -195,6 +193,11 @@ class Consensus:
                 identity += "=" * (-len(identity) % 4)
                 identity = b16encode(b64decode(identity.encode())).decode()
 
+                if dir_port == 0:
+                    # This onion router doesn't support retrieving descriptors over HTTP.
+                    onion_router = None
+                    continue
+
                 onion_router = OnionRouter(nickname, ip, dir_port, tor_port, identity)
             elif line.startswith("s "):
                 # This line contains the onion router's flags.
@@ -228,6 +231,13 @@ class Consensus:
                 guard_relays.append(onion_router)
 
         return random.choice(guard_relays)
+
+    def get_random_onion_router(self):
+        """
+        :return: A random onion router.
+        :rtype: OnionRouter
+        """
+        return random.choice(self._parsed_consensus)
 
 
 class CellDestroyedReason:
@@ -326,7 +336,7 @@ class Cell:
         :type circuit_id: int
         :param command: The type of command this cell is.
         :type command: int
-        :param payload: This is the actual request/response data.
+        :param payload: This is the actual request (list)/response (dict) data.
         """
         self.circuit_id = circuit_id
         self.command = command
@@ -399,8 +409,8 @@ class Cell:
     def is_variable_length_command(command):
         """
         On a version 2 connection, variable-length cells are indicated by a
-        command byte equal to 7 ("VERSIONS").  On a version 3 or
-        higher connection, variable-length cells are indicated by a command
+        command byte equal to 7 ("VERSIONS").
+        On a version 3 or higher connection, variable-length cells are indicated by a command
         byte equal to 7 ("VERSIONS"), or greater than or equal to 128.
 
         See tor-spec.txt 3. "Cell Packet format"
@@ -425,6 +435,7 @@ class Ed25519:
         - https://monero.stackexchange.com/questions/9820/recursionerror-in-ed25519-py
         - https://crypto.stackexchange.com/questions/47147/ed25519-is-a-signature-or-just-elliptic-curve
         - https://github.com/Marten4n6/TinyTor/issues/3
+        - https://github.com/Marten4n6/TinyTor/pull/4
     """
 
     def __init__(self):
@@ -610,6 +621,14 @@ class Ed25519:
 
 
 class KeyAgreementNTOR:
+    """Handles performing NTOR handshakes."""
+
+    PROTOCOL_ID = b'ntor-curve25519-sha256-1'
+    t_mac = PROTOCOL_ID + b':mac'
+    t_key = PROTOCOL_ID + b':key_extract'
+    t_verify = PROTOCOL_ID + b':verify'
+    m_expand = PROTOCOL_ID + b':key_expand'
+
     def __init__(self, onion_router):
         """:type onion_router: OnionRouter
 
@@ -629,18 +648,8 @@ class KeyAgreementNTOR:
                         a private/public keypair.
             m_expand  = PROTOID | ":key_expand"
             KEYID(A)  = A
-
-        H is defined as hmac()
-        MULT is included in the curve25519 library as get_shared_key()
-        KEYGEN() is curve25519.Private()
         """
         self._onion_router = onion_router
-
-        self._PROTOCOL_ID = b'ntor-curve25519-sha256-1'
-        self._t_mac = self._PROTOCOL_ID + b':mac'
-        self._t_key = self._PROTOCOL_ID + b':key_extract'
-        self._t_verify = self._PROTOCOL_ID + b':verify'
-        self._m_expand = self._PROTOCOL_ID + b':key_expand'
 
         # To perform the handshake, the client needs to know an identity key
         # digest for the server, and an ntor onion key (a curve25519 public
@@ -662,34 +671,42 @@ class KeyAgreementNTOR:
         self._handshake += self._X
 
     def get_handshake(self):
+        """:rtype: bytes"""
         return self._handshake
 
     @staticmethod
-    def _hmac(key, msg):
+    def _hmac_sha256(key, msg):
         h = hmac.HMAC(key, digestmod=hashlib.sha256)
         h.update(msg)
         return h.digest()
 
     def _kdf_rfc5869(self, key, salt, info, n):
-        prk = self._hmac(salt, key)
+        prk = self._hmac_sha256(salt, key)
         out = b""
         last = b""
         i = 1
+
         while len(out) < n:
             m = last + info + int2byte(i)
-            last = h = self._hmac(prk, m)
+            last = h = self._hmac_sha256(prk, m)
             out += h
             i = i + 1
+
         return out[:n]
 
     def _kdf_ntor(self, key, n):
-        return self._kdf_rfc5869(key, self._t_key, self._m_expand, n)
+        return self._kdf_rfc5869(key, KeyAgreementNTOR.t_key, KeyAgreementNTOR.m_expand, n)
 
     def complete_handshake(self, Y, auth):
         """
+        :type Y: bytes
+        :type auth: bytes
+
         The server's handshake reply is:
             SERVER_PK   Y                       [G_LENGTH bytes]
             AUTH        H(auth_input, t_mac)    [H_LENGTH bytes]
+
+        Updates the onion router's shared secret with the computed key.
         """
         # The client then checks Y is in G^* [see NOTE below], and computes
         # secret_input = EXP(Y,x) | EXP(B,x) | ID | B | X | Y | PROTOID
@@ -701,10 +718,9 @@ class KeyAgreementNTOR:
         secret_input += Y
         secret_input += b'ntor-curve25519-sha256-1'
 
-        # KEY_SEED = H(secret_input, t_key)
+        # KEY_SEED = H(secret_input, t_key) -- Not used.
         # verify = H(secret_input, t_verify)
-        key_seed = self._hmac(self._t_key, secret_input)
-        verify = self._hmac(self._t_verify, secret_input)
+        verify = self._hmac_sha256(KeyAgreementNTOR.t_verify, secret_input)
 
         # auth_input = verify | ID | B | Y | X | PROTOID | "Server"
         auth_input = verify
@@ -712,19 +728,16 @@ class KeyAgreementNTOR:
         auth_input += self._B
         auth_input += Y
         auth_input += self._X
-        auth_input += self._PROTOCOL_ID
+        auth_input += KeyAgreementNTOR.PROTOCOL_ID
         auth_input += b'Server'
 
         # The client verifies that AUTH == H(auth_input, t_mac).
-        if auth != self._hmac(self._t_mac, auth_input):
+        if auth != self._hmac_sha256(KeyAgreementNTOR.t_mac, auth_input):
             log.error("Server handshake doesn't match verification")
             raise Exception("Server handshake doesn't match verificaiton.")
 
         log.debug("Handshake verified, onion router's shared secret has been set.")
 
-        # Both parties now have a shared value for KEY_SEED.  They expand this
-        # into the keys needed for the Tor relay protocol, using the KDF
-        # described in 5.2.2 and the tag m_expand.
         self._onion_router.shared_key = self._kdf_ntor(secret_input, 72)
 
 
@@ -737,10 +750,14 @@ class Circuit:
         """
         self._tor_socket = tor_socket
         self._circuit_id = random.randint(2 ** 31, 2 ** 31)  # C int value range (4 bytes)
+        self._forbidden_onion_routers = []  # Onion routers associated to this circuit.
 
     def get_circuit_id(self):
         """:rtype: int"""
         return self._circuit_id
+
+    def get_forbidden_onion_router(self):
+        return self._forbidden_onion_routers
 
     def create(self):
         """
@@ -755,7 +772,6 @@ class Circuit:
         See tor-spec.txt 5.1. "CREATE and CREATED cells"
         """
         log.debug("Performing NTOR handshake...")
-
         ntor = KeyAgreementNTOR(self._tor_socket.get_guard_relay())
 
         self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, [
@@ -765,14 +781,11 @@ class Circuit:
         ]))
 
         log.debug("Waiting for response...")
-
         cell = self._tor_socket.retrieve_cell()
-
         log.debug("Verifying response...")
 
-        _, Y, auth = struct.unpack("!H32s32s", cell.payload[:66])
-
-        ntor.complete_handshake(Y, auth)
+        ntor.complete_handshake(cell.payload["Y"], cell.payload["auth"])
+        self._forbidden_onion_routers.append(self._tor_socket.get_guard_relay())
 
     def handle_cell(self, cell):
         """Handles a cell response related to this circuit, called by TorSocket.
@@ -835,12 +848,17 @@ class TorSocket:
         self._socket.close()
 
     def create_circuit(self):
-        """Creates a path to the final destination."""
+        """Initializes a circuit with the guard relay.
+
+        :rtype: Circuit
+        """
         circuit = Circuit(self)
         circuit.create()
 
         log.debug("Circuit created, assigned ID: %s" % circuit.get_circuit_id())
         self._circuits[circuit.get_circuit_id()] = circuit
+
+        return circuit
 
     def send_cell(self, cell):
         """Sends a cell to the guard relay.
@@ -892,12 +910,22 @@ class TorSocket:
                     versions.append(struct.unpack("!H", payload[:2])[0])
                     payload = payload[2:]
 
-                return Cell(circuit_id, command, versions)
+                return Cell(circuit_id, command, {"versions": versions})
             elif command == CommandType.NETINFO:
                 our_address_length = int(struct.unpack("!B", payload[5:][:1])[0])
                 our_address = socket.inet_ntoa(payload[6:][:our_address_length])
 
-                return Cell(circuit_id, command, [our_address])
+                return Cell(circuit_id, command, {"our_address": our_address})
+            elif command == CommandType.CREATED2:
+                # A CREATED2 cell contains:
+                #     HLEN      (Server Handshake Data Len) [2 bytes]
+                #     HDATA     (Server Handshake Data)     [HLEN bytes]
+                data_length = struct.unpack("!H", payload[:2])[0]
+                data = payload[2:data_length + 2]
+                y = data[:32]
+                auth = data[32:]
+
+                return Cell(circuit_id, command, {"Y": y, "auth": auth})
             else:
                 log.debug("===== START UNKNOWN CELL =====")
                 log.debug("Circuit ID: " + str(circuit_id))
@@ -943,7 +971,7 @@ class TorSocket:
         versions_cell = self.retrieve_cell()
 
         log.debug("Supported link protocol versions: %s" % versions_cell.payload)
-        self._protocol_versions = versions_cell.payload
+        self._protocol_versions = versions_cell.payload["versions"]
 
     def _retrieve_certs(self):
         log.debug("Retrieving CERTS cell...")
@@ -956,7 +984,7 @@ class TorSocket:
         log.debug("Retrieving NET_INFO cell...")
         cell = self.retrieve_cell()
 
-        self._our_public_ip = cell.payload[0]
+        self._our_public_ip = cell.payload["our_address"]
         log.debug("Our public IP address: " + self._our_public_ip)
 
     def _send_net_info(self):
@@ -1020,25 +1048,17 @@ class TinyTor:
         :type url: str
         :rtype: str
         """
-        while True:
+        while True:  # Filters may block visiting the guard relay's descriptor URL.
             try:
                 guard_relay = self._consensus.get_random_guard_relay()
-
-                if guard_relay.dir_port == 0:
-                    # Some guard relays don't seem to support retrieving
-                    # the descriptors over HTTP.
-                    continue
 
                 log.debug("Using guard relay \"%s\"..." % guard_relay.nickname)
                 log.debug("Descriptor URL: %s" % guard_relay.get_descriptor_url())
                 log.debug("Parsing the guard relays keys...")
 
-                # Populate the guard relay's keys...
-                # Filters may block visiting the guard relay's descriptor URL.
-                # Let's loop until that doesn't happen.
                 guard_relay.parse_descriptor()
                 break
-            except Exception as ex:
+            except HTTPError:
                 traceback.print_exc()
                 log.info("Retrying with a different guard relay...")
 
@@ -1047,8 +1067,9 @@ class TinyTor:
 
         try:
             tor_socket.connect()
-            tor_socket.create_circuit()
-        except Exception as ex:
+
+            circuit = tor_socket.create_circuit()
+        except HTTPError:
             traceback.print_exc()
             log.info("Retrying to perform HTTP request...")
 
