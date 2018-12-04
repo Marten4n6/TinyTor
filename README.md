@@ -6,7 +6,7 @@
   <br>
 </h1>
 
-<h4 align="center">A tiny Tor client implementation (written in python).</h4>
+<h4 align="center">A tiny Tor client implementation (pure python).</h4>
 
 <p align="center">
   <a href="https://github.com/Marten4n6/TinyTor/blob/master/LICENSE.txt">
@@ -21,7 +21,7 @@
   <a href="https://travis-ci.org/Marten4n6/TinyTor">
       <img src="https://img.shields.io/travis/Marten4n6/TinyTor/master.svg?style=flat-square" alt="Build Status">
   </a>
-  <a href="https://github.com/Marten4n6/TinyTor">
+  <a href="https://github.com/Marten4n6/TinyTor/pulls">
       <img src="https://img.shields.io/badge/contributions-welcome-brightgreen.svg?style=flat-square" alt="Contributing">
   </a>
 </p>
@@ -31,7 +31,8 @@
 ## Features
 
 TinyTor can be used to communicate with [onion services](https://www.torproject.org/docs/onion-services.html) via [Tor](https://www.torproject.org/about/overview#thesolution). <br/>
-Furthermore, it may be used by developers as a simple library. <br/>
+This may be used as a simple command line utility, or by developers as a python [package](https://pypi.org/). <br/>
+Goals are to have **no dependencies**, live in a **single file** and be **as small as possible** (currently ~38 KB).
 
 **If you're reading this, this implementation is NOT FINISHED yet.**
 
@@ -60,12 +61,12 @@ print(tor.http_get("example.onion"))
 ## Motivation
 
 TinyTor was created to communicate anonymously in [EvilOSX](https://github.com/Marten4n6/EvilOSX). <br/>
-It's goal is to run **natively** on Linux/macOS, live in a single file and be as small as possible.
+[compressed.py](https://github.com/Marten4n6/TinyTor/blob/master/compressed.py) compresses TinyTor to a *much* smaller size, which is about ~9KB (used in EvilOSX).
 
 ## Technical details
 
-TinyTor uses the system's OpenSSL for encryption. <br/>
-Because macOS uses [LibreSSL](https://www.libressl.org/) which doesn't currently support curve25519, the TAP handshake is used (instead of NTOR).
+TinyTor uses NTOR which is newer type of handshake and uses curve25519. <br/>
+A small curve25519 implementation is included, which is modified from [here](https://github.com/torproject/tor/tree/master/src/test).
 
 | Name                  | Description                                                             |
 | --------------------- | ----------------------------------------------------------------------- |
@@ -113,7 +114,7 @@ For more information on volunteering, please visit https://www.torproject.org/ge
 
 ## Issues
 
-Feel free to submit any issues or concerns [here](https://github.com/Marten4n6/TinyTor/issues).
+Feel free to submit any issues [here](https://github.com/Marten4n6/TinyTor/issues).
 
 ## References
 
@@ -124,6 +125,7 @@ Feel free to submit any issues or concerns [here](https://github.com/Marten4n6/T
   [1](https://jordan-wright.com/blog/2015/02/28/how-tor-works-part-one/),
   [2](https://jordan-wright.com/blog/2015/05/09/how-tor-works-part-two-relays-vs-bridges/),
   [3](https://jordan-wright.com/blog/2015/05/14/how-tor-works-part-three-the-consensus/)
+- Thanks to [Lucas Ontivero](https://github.com/lontivero) for his code contributions
 - Logo created by [motusora](https://www.behance.net/motusora)
 
 ## License
