@@ -707,7 +707,7 @@ class Circuit:
         :type tor_socket: TorSocket
         """
         self._tor_socket = tor_socket
-        self._circuit_id = random.randint(2 ** 31, 2 ** 31)  # C int value range (4 bytes)
+        self._circuit_id = random.randint(2 ** 31, (2 ** 32) - 1)  # C int value range (4 bytes)
         self._forbidden_onion_routers = []  # Onion routers associated to this circuit.
 
     def get_circuit_id(self):
@@ -758,7 +758,7 @@ class Circuit:
             "ip": socket.inet_aton(onion_router.ip),
             "port": onion_router.tor_port,
             # Link specifier
-            "fingerprint": b16decode(onion_router.fingerprint),
+            "fingerprint": b16decode(onion_router.fingerprint.encode()),
             # Data
             "onion_skin": onion_skin
         }))
@@ -886,16 +886,25 @@ class TorSocket:
                 our_address = socket.inet_ntoa(payload[6:][:our_address_length])
 
                 return Cell(circuit_id, command, {"our_address": our_address})
-            elif command == CommandType.CREATED2:
+            elif command == CommandType.CREATED2 or command == CommandType.RELAY_EXTENDED2:
                 # A CREATED2 cell contains:
                 #     DATA_LEN      (Server Handshake Data Len) [2 bytes]
                 #     DATA          (Server Handshake Data)     [DATA_LEN bytes]
+                #
+                # The payload of an EXTENDED2 cell is the same as the payload of a
+                # CREATED2 cell.
                 data_length = struct.unpack("!H", payload[:2])[0]
                 data = payload[2:data_length + 2]
                 y = data[:32]
                 auth = data[32:]
 
                 return Cell(circuit_id, command, {"Y": y, "auth": auth})
+            elif command == CommandType.DESTROY:
+                # The payload of a RELAY_TRUNCATED or DESTROY cell contains a single octet,
+                # describing why the circuit is being closed or truncated.
+                reason = payload[0];
+                log.warning("Circuit ID" + str(circuit_id) + " destroyed. Reason: " + str(reason))
+                return Cell(circuit_id, command, {"reason": payload[0]})
             else:
                 log.debug("===== START UNKNOWN CELL =====")
                 log.debug("Circuit ID: " + str(circuit_id))
