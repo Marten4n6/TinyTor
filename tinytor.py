@@ -336,7 +336,8 @@ class Cell:
         :type circuit_id: int
         :param command: The type of command this cell is.
         :type command: int
-        :param payload: This is the actual request (list)/response (dict) data.
+        :param payload: This is the actual request/response data.
+        :type payload: dict
         """
         self.circuit_id = circuit_id
         self.command = command
@@ -353,7 +354,7 @@ class Cell:
 
         if self.command == CommandType.VERSIONS:
             # The payload in a VERSIONS cell is a series of big-endian two-byte integers.
-            payload_bytes = struct.pack("!" + ("H" * len(self.payload)), *self.payload)
+            payload_bytes = struct.pack("!" + ("H" * len(self.payload["versions"])), *self.payload["versions"])
         elif self.command == CommandType.NETINFO:
             # Timestamp              [4 bytes]
             # Other OR's address     [variable]
@@ -372,18 +373,32 @@ class Cell:
             #    0x06 -- IPv6 address
             #    0xF0 -- Error, transient
             #    0xF1 -- Error, nontransient
-            timestamp = struct.pack("!I", self.payload[0])
-            other_or_address = struct.pack("!BB", 4, 4) + socket.inet_aton(self.payload[1][2])
+            timestamp = struct.pack("!I", self.payload["timestamp"])
+            other_or_address = struct.pack("!BB", 4, 4) + socket.inet_aton(self.payload["other_ip"])
             number_of_addresses = struct.pack("!B", 1)
-            this_or_address = struct.pack("!BB", 4, 4) + socket.inet_aton(self.payload[3][2])
+            this_or_address = struct.pack("!BB", 4, 4) + socket.inet_aton(self.payload["our_ip"])
 
             payload_bytes = timestamp + other_or_address + number_of_addresses + this_or_address
         elif self.command == CommandType.CREATE2:
             # A CREATE2 cell contains:
-            #     HTYPE     (Client Handshake Type)     [2 bytes]
-            #     HLEN      (Client Handshake Data Len) [2 bytes]
-            #     HDATA     (Client Handshake Data)     [HLEN bytes]
-            payload_bytes = struct.pack("!HH", self.payload[0], self.payload[1]) + self.payload[2]
+            #     H_TYPE     (Client Handshake Type)     [2 bytes]
+            #     H_LEN      (Client Handshake Data Len) [2 bytes]
+            #     H_DATA     (Client Handshake Data)     [H_LEN bytes]
+            payload_bytes = struct.pack("!HH", self.payload["type"], self.payload["length"]) + self.payload["data"]
+        elif self.command == CommandType.RELAY_EXTEND2:
+            # An EXTEND2 cell's relay payload contains:
+            #     NSPEC      (Number of link specifiers)     [1 byte]
+            #       NSPEC times:
+            #         LSTYPE (Link specifier type)           [1 byte]
+            #         LSLEN  (Link specifier length)         [1 byte]
+            #         LSPEC  (Link specifier)                [LSLEN bytes]
+            #     HTYPE      (Client Handshake Type)         [2 bytes]
+            #     HLEN       (Client Handshake Data Len)     [2 bytes]
+            #     HDATA      (Client Handshake Data)         [HLEN bytes]
+            payload_bytes = struct.pack("!B", 2)
+            payload_bytes += struct.pack("!BB4sH", 0, 6, self.payload["ip"], self.payload["port"])
+            payload_bytes += struct.pack("!BB20s", 2, 20, self.payload["fingerprint"])
+            payload_bytes += struct.pack("!HH", 2, len(self.payload["onion_skin"])) + self.payload["onion_skin"]
         else:
             log.error("Invalid payload format for command: " + str(self.command))
 
@@ -431,10 +446,10 @@ class Ed25519:
 
     References:
         - https://ed25519.cr.yp.to/python/ed25519.py
+        - https://github.com/itdaniher/slownacl/blob/master/curve25519.py
         - https://gitweb.torproject.org/tor.git/tree/src/test/ed25519_exts_ref.py
         - https://monero.stackexchange.com/questions/9820/recursionerror-in-ed25519-py
         - https://crypto.stackexchange.com/questions/47147/ed25519-is-a-signature-or-just-elliptic-curve
-        - https://github.com/Marten4n6/TinyTor/issues/3
         - https://github.com/Marten4n6/TinyTor/pull/4
     """
 
@@ -452,10 +467,6 @@ class Ed25519:
         self._By = 4 * self._inv(5)
         self._Bx = self._x_recover(self._By)
         self._B = [self._Bx % self._q, self._By % self._q]
-
-    @staticmethod
-    def _hash(m):
-        return hashlib.sha512(m).digest()
 
     def _exp_mod(self, b, e, m):
         if e == 0:
@@ -495,20 +506,6 @@ class Ed25519:
             Q = self._edwards(Q, P)
         return Q
 
-    def _encode_int(self, y):
-        bits = [(y >> i) & 1 for i in range(self._b)]
-        return b''.join([int2byte(sum([bits[i * 8 + j] << j for j in range(8)])) for i in range(self._b // 8)])
-
-    def _encode_point(self, P):
-        x = P[0]
-        y = P[1]
-        bits = [(y >> i) & 1 for i in range(self._b - 1)] + [x & 1]
-        return b''.join([int2byte(sum([bits[i * 8 + j] << j for j in range(8)])) for i in range(self._b // 8)])
-
-    @staticmethod
-    def _bit(h, i):
-        return (indexbytes(h, i // 8) >> (i % 8)) & 1
-
     def get_public_key(self, sk):
         sk = self.clamp(self.unpack(sk))
         return self.pack(self.exp(sk, 9))
@@ -517,51 +514,6 @@ class Ed25519:
     def create_secret_key():
         return urandom(32)
 
-    def _hint(self, m):
-        h = self._hash(m)
-        return sum(2 ** i * self._bit(h, i) for i in range(2 * self._b))
-
-    def signature(self, m, sk, pk):
-        h = self._hash(sk)
-        a = 2 ** (self._b - 2) + sum(2 ** i * self._bit(h, i) for i in range(3, self._b - 2))
-        r = self._hint(intlist2bytes([indexbytes(h, j) for j in range(self._b // 8, self._b // 4)]) + m)
-        R = self._scalar_mult(self._B, r)
-        S = (r + self._hint(self._encode_point(R) + pk + m) * a) % self._l
-        return self._encode_point(R) + self._encode_int(S)
-
-    def _is_on_curve(self, P):
-        x = P[0]
-        y = P[1]
-        return (-x * x + y * y - 1 - self._d * x * x * y * y) % self._q == 0
-
-    def _decode_int(self, s):
-        return sum(2 ** i * self._bit(s, i) for i in range(0, self._b))
-
-    def _decode_point(self, s):
-        y = sum(2 ** i * self._bit(s, i) for i in range(0, self._b - 1))
-        x = self._x_recover(y)
-        if x & 1 != self._bit(s, self._b - 1):
-            x = self._q - x
-        P = [x, y]
-        if not self._is_on_curve(P):
-            raise Exception("Decoding point that is not on curve.")
-
-        return P
-
-    def check_valid(self, s, m, pk):
-        if len(s) != self._b // 4:
-            raise Exception("Signature length is wrong.")
-        if len(pk) != self._b // 8:
-            raise Exception("Public-key length is wrong.")
-        R = self._decode_point(s[0:self._b // 8])
-        A = self._decode_point(pk)
-        S = self._decode_int(s[self._b // 8:self._b // 4])
-        h = self._hint(self._encode_point(R) + pk + m)
-        if self._scalar_mult(self._B, S) != self._edwards(R, self._scalar_mult(A, h)):
-            raise Exception("Signature does not pass verification.")
-
-    # Addition and doubling formulas taken from Appendix D of "Curve25519:
-    # new Diffie-Hellman speed records".
     def add(self, n, m, d):
         (xn, zn), (xm, zm), (xd, zd) = n, m, d
         x = 4 * (xm * xn - zm * zn) ** 2 * zd
@@ -578,8 +530,6 @@ class Ed25519:
         one = (base, 1)
         two = self.double(one)
 
-        # f(m) evaluates to a tuple containing the mth multiple and the
-        # (m+1)th multiple of base.
         def f(m):
             if m == 1:
                 return one, two
@@ -600,7 +550,8 @@ class Ed25519:
     def ba2bs(self, ba):
         return bytes(ba)
 
-    def clamp(self, n):
+    @staticmethod
+    def clamp(n):
         n &= ~7
         n &= ~(128 << 8 * 31)
         n |= 64 << 8 * 31
@@ -652,9 +603,9 @@ class KeyAgreementNTOR:
         self._onion_router = onion_router
 
         # To perform the handshake, the client needs to know an identity key
-        # digest for the server, and an ntor onion key (a curve25519 public
-        # key) for that server. Call the ntor onion key "B".  The client
-        # generates a temporary keypair:
+        # digest for the server, and an NTOR onion key (a curve25519 public
+        # key) for that server. Call the NTOR onion key "B".  The client
+        # generates a temporary key-pair:
         #     x,X = KEYGEN()
         self._ed25519 = Ed25519()
         self._x = self._ed25519.create_secret_key()
@@ -663,7 +614,7 @@ class KeyAgreementNTOR:
         self._B = b64decode(self._onion_router.key_ntor.encode())
 
         # and generates a client-side handshake with contents:
-        #     NODEID      Server identity digest  [ID_LENGTH bytes]
+        #     NODE_ID     Server identity digest  [ID_LENGTH bytes]
         #     KEYID       KEYID(B)                [H_LENGTH bytes]
         #     CLIENT_PK   X                       [G_LENGTH bytes]
         self._handshake = b16decode(self._onion_router.fingerprint.encode())
@@ -680,22 +631,29 @@ class KeyAgreementNTOR:
         h.update(msg)
         return h.digest()
 
-    def _kdf_rfc5869(self, key, salt, info, n):
-        prk = self._hmac_sha256(salt, key)
+    def _kdf_rfc5869(self, key, n):
+        """
+        In RFC5869's vocabulary, this is HKDF-SHA256 with info == m_expand,
+        salt == t_key, and IKM == secret_input.
+
+        See tor-spec.txt 5.2.2. "KDF-RFC5869"
+
+        :type key: bytes
+        :type n: int
+        :return: The shared key.
+        """
+        prk = self._hmac_sha256(KeyAgreementNTOR.t_key, key)
         out = b""
         last = b""
         i = 1
 
         while len(out) < n:
-            m = last + info + int2byte(i)
+            m = last + KeyAgreementNTOR.m_expand + int2byte(i)
             last = h = self._hmac_sha256(prk, m)
             out += h
             i = i + 1
 
         return out[:n]
-
-    def _kdf_ntor(self, key, n):
-        return self._kdf_rfc5869(key, KeyAgreementNTOR.t_key, KeyAgreementNTOR.m_expand, n)
 
     def complete_handshake(self, Y, auth):
         """
@@ -738,7 +696,7 @@ class KeyAgreementNTOR:
 
         log.debug("Handshake verified, onion router's shared secret has been set.")
 
-        self._onion_router.shared_key = self._kdf_ntor(secret_input, 72)
+        self._onion_router.shared_key = self._kdf_rfc5869(secret_input, 72)
 
 
 class Circuit:
@@ -756,9 +714,6 @@ class Circuit:
         """:rtype: int"""
         return self._circuit_id
 
-    def get_forbidden_onion_router(self):
-        return self._forbidden_onion_routers
-
     def create(self):
         """
         Users set up circuits incrementally, one hop at a time. To create a
@@ -771,28 +726,45 @@ class Circuit:
 
         See tor-spec.txt 5.1. "CREATE and CREATED cells"
         """
-        log.debug("Performing NTOR handshake...")
-        ntor = KeyAgreementNTOR(self._tor_socket.get_guard_relay())
+        log.debug("Performing handshake...")
+        key_agreement = KeyAgreementNTOR(self._tor_socket.get_guard_relay())
 
-        self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, [
-            0x0002,
-            len(ntor.get_handshake()),
-            ntor.get_handshake()
-        ]))
+        self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, {
+            "type": 2,  # NTOR
+            "length": len(key_agreement.get_handshake()),
+            "data": key_agreement.get_handshake()
+        }))
 
         log.debug("Waiting for response...")
         cell = self._tor_socket.retrieve_cell()
         log.debug("Verifying response...")
 
-        ntor.complete_handshake(cell.payload["Y"], cell.payload["auth"])
-        self._forbidden_onion_routers.append(self._tor_socket.get_guard_relay())
+        key_agreement.complete_handshake(cell.payload["Y"], cell.payload["auth"])
 
-    def handle_cell(self, cell):
-        """Handles a cell response related to this circuit, called by TorSocket.
+    def extend(self, onion_router):
+        """Extends the circuit to the specified onion router.
 
-        :type cell: Cell
+        :type onion_router: OnionRouter
         """
-        pass
+        log.debug("Extending circuit to \"%s\"..." % onion_router.nickname)
+
+        onion_router.parse_descriptor()
+        onion_skin = KeyAgreementNTOR(onion_router).get_handshake()
+
+        # To extend an existing circuit, the client sends an EXTEND or EXTEND2
+        # relay cell to the last node in the circuit.
+        self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.RELAY_EXTEND2, {
+            # Link specifier
+            "ip": socket.inet_aton(onion_router.ip),
+            "port": onion_router.tor_port,
+            # Link specifier
+            "fingerprint": b16decode(onion_router.fingerprint),
+            # Data
+            "onion_skin": onion_skin
+        }))
+
+        log.debug("Waiting for response...")
+        cell = self._tor_socket.retrieve_cell()
 
 
 class TorSocket:
@@ -808,7 +780,6 @@ class TorSocket:
         )
         self._protocol_versions = [3]
         self._our_public_ip = "0"
-        self._shutdown_requested = False
 
         # Dictionary of circuits this socket is attached to (key = circuit's ID).
         self._circuits = dict()
@@ -830,12 +801,12 @@ class TorSocket:
         # responder sends a VERSIONS cell, a CERTS cell (4.2 below) to give the
         # initiator the certificates it needs to learn the responder's
         # identity, an AUTH_CHALLENGE cell (4.3) that the initiator must include
-        # as part of its answer if it chooses to authenticate, and a NETINFO
+        # as part of its answer if it chooses to authenticate, and a NET_INFO
         # cell (4.5).  As soon as it gets the CERTS cell, the initiator knows
         # whether the responder is correctly authenticated.  At this point the
         # initiator behaves differently depending on whether it wants to
         # authenticate or not. If it does not want to authenticate, it MUST
-        # send a NETINFO cell.
+        # send a NET_INFO cell.
         self._send_versions()
         self._retrieve_versions()
         self._retrieve_certs()
@@ -844,7 +815,6 @@ class TorSocket:
 
     def close(self):
         """Closes the tor socket (and circuit)."""
-        self._shutdown_requested = True
         self._socket.close()
 
     def create_circuit(self):
@@ -884,14 +854,14 @@ class TorSocket:
 
         # Variable length cells have the following format:
         #
-        #    CircID                             [CIRCID_LEN octets]
+        #    CircuitID                          [CIRCUIT_ID_LEN octets]
         #    Command                            [1 octet]
         #    Length                             [2 octets; big-endian integer]
         #    Payload (some commands MAY pad)    [Length bytes]
         #
         # Fixed-length cells have the following format:
         #
-        #    CircID                              [CIRCID_LEN bytes]
+        #    CircuitID                           [CIRCUIT_ID_LEN bytes]
         #    Command                             [1 byte]
         #    Payload (padded with padding bytes) [PAYLOAD_LEN bytes]
         if Cell.is_variable_length_command(command):
@@ -918,8 +888,8 @@ class TorSocket:
                 return Cell(circuit_id, command, {"our_address": our_address})
             elif command == CommandType.CREATED2:
                 # A CREATED2 cell contains:
-                #     HLEN      (Server Handshake Data Len) [2 bytes]
-                #     HDATA     (Server Handshake Data)     [HLEN bytes]
+                #     DATA_LEN      (Server Handshake Data Len) [2 bytes]
+                #     DATA          (Server Handshake Data)     [DATA_LEN bytes]
                 data_length = struct.unpack("!H", payload[:2])[0]
                 data = payload[2:data_length + 2]
                 y = data[:32]
@@ -932,22 +902,7 @@ class TorSocket:
                 log.debug("Command type: " + str(command))
                 log.debug("Payload: " + str(payload))
                 log.debug("===== END UNKNOWN CELL   =====")
-                return Cell(circuit_id, command, payload)
-
-    def _receive_cell_loop(self):
-        """Loop which receives cells and passes them onto the associated circuit."""
-        log.debug("Starting cell receive loop...")
-
-        while True:
-            if self._shutdown_requested:
-                log.debug("Shutting down cell receive loop...")
-                break
-
-            cell = self.retrieve_cell()
-
-            self._circuits[cell.circuit_id].handle(cell)
-
-            log.debug("Cell received, waiting for cell...")
+                return Cell(circuit_id, command, {"payload": payload})
 
     def _send_versions(self):
         """
@@ -964,13 +919,13 @@ class TorSocket:
         """
         log.debug("Sending VERSIONS cell...")
 
-        self.send_cell(Cell(0, CommandType.VERSIONS, [3, 4]))
+        self.send_cell(Cell(0, CommandType.VERSIONS, {"versions": [3, 4]}))
 
     def _retrieve_versions(self):
         log.debug("Retrieving VERSIONS cell...")
         versions_cell = self.retrieve_cell()
 
-        log.debug("Supported link protocol versions: %s" % versions_cell.payload)
+        log.debug("Supported link protocol versions: %s" % versions_cell.payload["versions"])
         self._protocol_versions = versions_cell.payload["versions"]
 
     def _retrieve_certs(self):
@@ -1012,12 +967,11 @@ class TorSocket:
         """
         log.debug("Sending NET_INFO cell...")
 
-        self.send_cell(Cell(0, CommandType.NETINFO, [
-            int(time()),
-            [0x04, 0x04, self._guard_relay.ip],
-            0x01,
-            [0x04, 0x04, self._our_public_ip]
-        ]))
+        self.send_cell(Cell(0, CommandType.NETINFO, {
+            "timestamp": int(time()),
+            "other_ip": self._guard_relay.ip,
+            "our_ip": self._our_public_ip
+        }))
 
 
 class TinyTor:
@@ -1069,6 +1023,7 @@ class TinyTor:
             tor_socket.connect()
 
             circuit = tor_socket.create_circuit()
+            circuit.extend(self._consensus.get_random_onion_router())
         except HTTPError:
             traceback.print_exc()
             log.info("Retrying to perform HTTP request...")
