@@ -14,11 +14,14 @@ import socket
 import ssl
 import struct
 import traceback
+from binascii import hexlify
 from argparse import ArgumentParser
-from base64 import b64decode, b16encode, b16decode
+from base64 import b64encode, b64decode, b16encode, b16decode
+import subprocess
 from os import urandom
 from sys import exit
 from time import time
+from threading import Thread
 
 try:
     from urllib.request import Request, urlopen, HTTPError
@@ -120,6 +123,17 @@ class OnionRouter:
             if line.startswith("ntor-onion-key "):
                 self.key_ntor = line.split("ntor-onion-key")[1].strip()
                 break
+
+    def encrypt_relay_cell(self, relay_bytes):
+        """Encrypts the given bytes with out stream cipher using the set shared key.
+
+        :type relay_bytes: bytes
+        """
+        hex_key = hexlify(self.shared_key.encode()).decode()
+        command = "echo '%s' | openssl enc -aes-128-ctr -e -base64 -K %s" % (b64encode(relay_bytes).decode(), hex_key)
+        out, err = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+
+        return out + err
 
 
 class Consensus:
@@ -581,25 +595,7 @@ class KeyAgreementNTOR:
     m_expand = PROTOCOL_ID + b':key_expand'
 
     def __init__(self, onion_router):
-        """:type onion_router: OnionRouter
-
-        In this section, define:
-            H(x,t) as HMAC_SHA256 with message x and key t.
-            H_LENGTH  = 32.
-            ID_LENGTH = 20.
-            G_LENGTH  = 32
-            PROTOID   = "ntor-curve25519-sha256-1"
-            t_mac     = PROTOID | ":mac"
-            t_key     = PROTOID | ":key_extract"
-            t_verify  = PROTOID | ":verify"
-            MULT(a,b) = the multiplication of the curve25519 point 'a' by the
-                        scalar 'b'.
-            G         = The preferred base point for curve25519 ([9])
-            KEYGEN()  = The curve25519 key generation algorithm, returning
-                        a private/public keypair.
-            m_expand  = PROTOID | ":key_expand"
-            KEYID(A)  = A
-        """
+        """:type onion_router: OnionRouter"""
         self._onion_router = onion_router
 
         # To perform the handshake, the client needs to know an identity key
@@ -621,7 +617,7 @@ class KeyAgreementNTOR:
         self._handshake += self._B
         self._handshake += self._X
 
-    def get_handshake(self):
+    def get_onion_skin(self):
         """:rtype: bytes"""
         return self._handshake
 
@@ -714,7 +710,7 @@ class Circuit:
         """:rtype: int"""
         return self._circuit_id
 
-    def create(self):
+    def create(self, onion_router):
         """
         Users set up circuits incrementally, one hop at a time. To create a
         new circuit, OPs send a CREATE/CREATE2 cell to the first node, with
@@ -727,12 +723,12 @@ class Circuit:
         See tor-spec.txt 5.1. "CREATE and CREATED cells"
         """
         log.debug("Performing handshake...")
-        key_agreement = KeyAgreementNTOR(self._tor_socket.get_guard_relay())
+        key_agreement = KeyAgreementNTOR(onion_router)
 
         self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, {
             "type": 2,  # NTOR
-            "length": len(key_agreement.get_handshake()),
-            "data": key_agreement.get_handshake()
+            "length": len(key_agreement.get_onion_skin()),
+            "data": key_agreement.get_onion_skin()
         }))
 
         log.debug("Waiting for response...")
@@ -742,29 +738,52 @@ class Circuit:
         key_agreement.complete_handshake(cell.payload["Y"], cell.payload["auth"])
 
     def extend(self, onion_router):
-        """Extends the circuit to the specified onion router.
+        """
+        To extend an existing circuit, the client sends an EXTEND2
+        relay cell to the last node in the circuit.
 
         :type onion_router: OnionRouter
         """
-        log.debug("Extending circuit to \"%s\"..." % onion_router.nickname)
-
+        log.debug("Requesting onion router \"%s\" to extend the circuit..." % onion_router.nickname)
         onion_router.parse_descriptor()
-        onion_skin = KeyAgreementNTOR(onion_router).get_handshake()
 
-        # To extend an existing circuit, the client sends an EXTEND or EXTEND2
-        # relay cell to the last node in the circuit.
-        self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.RELAY_EXTEND2, {
+        # The relay payload for an EXTEND2 relay cell consists of:
+        #       Address                    [4 bytes]
+        #       Port                       [2 bytes]
+        #       Onion skin                 [TAP_C_HANDSHAKE_LEN bytes]
+        #       Identity fingerprint       [HASH_LEN bytes]
+        extend2_cell_bytes = Cell(self.get_circuit_id(), CommandType.RELAY_EXTEND2, {
             # Link specifier
             "ip": socket.inet_aton(onion_router.ip),
             "port": onion_router.tor_port,
             # Link specifier
             "fingerprint": b16decode(onion_router.fingerprint.encode()),
             # Data
-            "onion_skin": onion_skin
-        }))
+            "onion_skin": KeyAgreementNTOR(onion_router).get_onion_skin()
+        }).get_bytes(self._tor_socket.get_max_protocol_version())
+
+        # When speaking v2 of the link protocol or later, clients MUST only send
+        # EXTEND2 cells inside RELAY_EARLY cells.
+        #
+        # The payload of each unencrypted RELAY cell consists of:
+        #       Relay command           [1 byte]
+        #       'Recognized'            [2 bytes]
+        #       StreamID                [2 bytes]
+        #       Digest                  [4 bytes]
+        #       Length                  [2 bytes]
+        #       Data                    [PAYLOAD_LEN-11 bytes]
+        
+        # TODO -
+        # TODO - Format into a RELAY_EARLY cell.
+        # TODO -
+        # self._tor_socket.send_cell(relay_cell)
 
         log.debug("Waiting for response...")
         cell = self._tor_socket.retrieve_cell()
+
+    def handle_cell(self, cell):
+        """:type cell: Cell"""
+        log.debug("Handling cell: %s" % str(cell))
 
 
 class TorSocket:
@@ -780,6 +799,8 @@ class TorSocket:
         )
         self._protocol_versions = [3]
         self._our_public_ip = "0"
+        self._receive_cell_loop = None
+        self._close_requested = False
 
         # Dictionary of circuits this socket is attached to (key = circuit's ID).
         self._circuits = dict()
@@ -790,6 +811,9 @@ class TorSocket:
         :rtype: OnionRouter
         """
         return self._guard_relay
+
+    def get_max_protocol_version(self):
+        return max(self._protocol_versions)
 
     def connect(self):
         """Connects the socket to the guard relay."""
@@ -816,6 +840,7 @@ class TorSocket:
     def close(self):
         """Closes the tor socket (and circuit)."""
         self._socket.close()
+        self._close_requested = True
 
     def create_circuit(self):
         """Initializes a circuit with the guard relay.
@@ -823,10 +848,15 @@ class TorSocket:
         :rtype: Circuit
         """
         circuit = Circuit(self)
-        circuit.create()
+        circuit.create(self.get_guard_relay())
 
         log.debug("Circuit created, assigned ID: %s" % circuit.get_circuit_id())
         self._circuits[circuit.get_circuit_id()] = circuit
+
+        if not self._receive_cell_loop:
+            self._receive_cell_loop = Thread(target=self._receive_cell_thread)
+            self._receive_cell_loop.daemon = True
+            self._receive_cell_loop.start()
 
         return circuit
 
@@ -835,7 +865,7 @@ class TorSocket:
 
         :type cell: Cell
         """
-        self._socket.write(cell.get_bytes(max(self._protocol_versions)))
+        self._socket.write(cell.get_bytes(self.get_max_protocol_version()))
 
     def retrieve_cell(self, ignore_response=False):
         """Waits for a cell response then parses it into a Cell object.
@@ -902,9 +932,10 @@ class TorSocket:
             elif command == CommandType.DESTROY:
                 # The payload of a RELAY_TRUNCATED or DESTROY cell contains a single octet,
                 # describing why the circuit is being closed or truncated.
-                reason = payload[0];
-                log.warning("Circuit ID" + str(circuit_id) + " destroyed. Reason: " + str(reason))
-                return Cell(circuit_id, command, {"reason": payload[0]})
+                reason = payload[1:]
+
+                log.warning("Circuit %s destroyed, reason: %s" % (str(circuit_id), str(reason)))
+                return Cell(circuit_id, command, {"reason": reason})
             else:
                 log.debug("===== START UNKNOWN CELL =====")
                 log.debug("Circuit ID: " + str(circuit_id))
@@ -981,6 +1012,20 @@ class TorSocket:
             "other_ip": self._guard_relay.ip,
             "our_ip": self._our_public_ip
         }))
+
+    def _receive_cell_thread(self):
+        """Receives cells and passes them onto the associated circuit."""
+        log.debug("Starting receive cell thread...")
+
+        while True:
+            if self._close_requested:
+                log.debug("Stopping receive cell thread...")
+                break
+
+            cell = self.retrieve_cell()
+            self._circuits[cell.circuit_id].handle_cell(cell)
+
+            log.debug("Cell received, waiting for cell...")
 
 
 class TinyTor:
