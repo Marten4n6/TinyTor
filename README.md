@@ -29,22 +29,29 @@
 ---
 
 ## Features
-**If you are reading this, this implementation is NOT FINISHED yet**.
-
 
 TinyTor can be used to communicate with [onion services](https://www.torproject.org/docs/onion-services.html) via [Tor](https://www.torproject.org/about/overview#thesolution). <br/>
-It may be used by developers as a simple python [package](https://pypi.org/) or as a command line utility. <br/>
+It may be used by developers as a [python package](https://pypi.org/project/tinytor/) or as a command line utility. <br/>
 
-The goals for this project are to require **no dependencies**, live in a **single file** and be **as small as possible**. <br/>
+The goals are to have **no dependencies**, live in a **single file** and be **as small as possible**. <br/>
 The current file size of TinyTor is only ~37KB (uncompressed). <br/>
 
-**Important warnings**:
+**Some warnings**:
 - TinyTor assumes OpenSSL is installed on the running machine (native on Linux/macOS)
 - This project is **not** related to the official Tor Project
 - For anything dependent on your privacy, please use the [Tor Browser](https://www.torproject.org/download/download-easy.html) or [Tails OS](https://tails.boum.org/)
 
 ## How To Use
 
+```bash
+# Install TinyTor
+$ sudo pip3 install tinytor
+
+# Send a HTTP request over Tor
+$ tinytor --host example.onion --verbose
+```
+
+### From Source
 ```bash
 # Download or clone this repository
 $ git clone https://github.com/Marten4n6/TinyTor
@@ -53,7 +60,7 @@ $ git clone https://github.com/Marten4n6/TinyTor
 $ cd TinyTor
 
 # Send a HTTP request over Tor
-$ python tinytor.py --host example.onion
+$ python tinytor.py --host example.onion --verbose
 ```
 
 ### For Developers
@@ -69,38 +76,6 @@ print(tor.http_get("example.onion"))
 
 TinyTor was created to communicate anonymously in [EvilOSX](https://github.com/Marten4n6/EvilOSX). <br/>
 [compressed.py](https://github.com/Marten4n6/TinyTor/blob/master/compressed.py) is used in EvilOSX, which compresses TinyTor to a *much* smaller size (about ~9KB).
-
-## Technical details
-
-TinyTor uses NTOR which is a newer type of handshake and uses curve25519. <br/>
-The small curve25519 implementation which is included is modified from [here](https://github.com/torproject/tor/tree/master/src/test).
-
-| Name                  | Description                                                             |
-| --------------------- | ----------------------------------------------------------------------- |
-| Entry / guard relay   | This is the entry point to the Tor network.                             |
-| Middle relay          | Prevents the guard and exit relay from knowing each other.              |
-| Exit relay            | Sends traffic to the final destination intended by the client.          |
-| Directory authority   | A trusted server where information about the Tor network is stored.     |
-| Consensus             | A document where all Tor relays is maintained.                          |
-| Descriptor            | Contains the public keys and other information about a relay.           |
-| Cell                  | A command request/response used when communicating with onion routers.  |
-| Circuit               | A path through the network connecting a client to its destination.      |
-
-The following steps are followed to create a request over the Tor network:
-1. Parse the consensus into a list of onion routers (by default 200 maximum)
-2. Select a random guard relay which is our introduction point into the network
-3. Parse the keys of our guard relay (fetched from it's HTTP descriptor)
-4. Perform the in-protocol handshake with the guard relay:
-   1. Send our supported link protocol versions
-   2. Retrieve supported link protocol versions
-   3. Retrieve certificates
-   4. Retrieve network information
-   5. We don't want to authenticate so we send our network information
-5. Create a circuit (path to the exit relay):
-   1. Create an onion skin (NTOR handshake), encrypted to the onion router's public onion key
-   2. Send the onion skin in a relay EXTEND2 cell along the circuit
-   3. When a relay EXTENDED2 cell is received, verify and calculate the shared keys.
-   4. The circuit is now extended, repeat this 3x
 
 ## Versioning
 
