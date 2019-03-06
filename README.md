@@ -28,6 +28,8 @@
 
 ---
 
+**This implementation is NOT FINISHED YET.**
+
 ## Features
 
 TinyTor can be used to communicate with [onion services](https://www.torproject.org/docs/onion-services.html) via [Tor](https://www.torproject.org/about/overview#thesolution). <br/>
@@ -117,7 +119,6 @@ Feel free to submit any issues [here](https://github.com/Marten4n6/TinyTor/issue
   [1](https://jordan-wright.com/blog/2015/02/28/how-tor-works-part-one/),
   [2](https://jordan-wright.com/blog/2015/05/09/how-tor-works-part-two-relays-vs-bridges/),
   [3](https://jordan-wright.com/blog/2015/05/14/how-tor-works-part-three-the-consensus/)
-- Thanks to [Lucas Ontivero](https://github.com/lontivero) for his code contributions
 - Logo created by [motusora](https://www.behance.net/motusora)
 
 ## License
