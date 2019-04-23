@@ -30,8 +30,6 @@
 
 **This implementation is NOT FINISHED YET.**
 
-## Features
-
 TinyTor can be used to communicate with [onion services](https://www.torproject.org/docs/onion-services.html) via [Tor](https://www.torproject.org/about/overview#thesolution). <br/>
 It may be used by developers as a [python package](https://pypi.org/project/tinytor/) or as a command line utility. <br/>
 
@@ -112,6 +110,7 @@ Feel free to submit any issues [here](https://github.com/Marten4n6/TinyTor/issue
 ## References
 
 - [Tor Protocol Specification](https://gitweb.torproject.org/torspec.git/tree/tor-spec.txt)
+- [Tor: The Second-Generation Onion Router](https://svn.torproject.org/svn/projects/design-paper/tor-design.html)
 - [Mini-tor](https://github.com/wbenny/mini-tor)
 - [Pycepa](https://github.com/pycepa/pycepa)
 - [Struct](https://docs.python.org/3/library/struct.html)
