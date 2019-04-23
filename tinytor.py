@@ -14,15 +14,17 @@ import socket
 import ssl
 import struct
 import traceback
-from binascii import hexlify
 from argparse import ArgumentParser
-from base64 import b64encode, b64decode, b16encode, b16decode
-import subprocess
+from base64 import b64decode, b16encode, b16decode
 from hashlib import sha1
 from os import urandom
 from sys import exit
 from time import time
-from threading import Thread
+
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher
+from cryptography.hazmat.primitives.ciphers.algorithms import AES
+from cryptography.hazmat.primitives.ciphers.modes import CTR
 
 try:
     from urllib.request import Request, urlopen, HTTPError
@@ -76,27 +78,25 @@ class DirectoryAuthority:
         :return: The URL to directory authority's consensus.
         :rtype: str
         """
-        return "http://%s:%s/tor/status-vote/current/consensus" % (
-            self.ip, self.dir_port
-        )
+        return "http://%s:%s/tor/status-vote/current/consensus" % (self.ip, self.dir_port)
 
 
 class OnionRouter:
     """This class represents an onion router in a circuit.."""
 
-    def __init__(self, nickname, ip, dir_port, tor_port, fingerprint):
+    def __init__(self, nickname, ip, dir_port, tor_port, identity):
         """
         :type nickname: str
         :type ip: str
         :type dir_port: int
         :type tor_port: int
-        :type fingerprint: str
+        :type identity: str
         """
         self.nickname = nickname
         self.ip = ip
         self.dir_port = dir_port
         self.tor_port = tor_port
-        self.fingerprint = fingerprint
+        self.identity = identity
 
         self.flags = None
         self.key_ntor = None
@@ -111,7 +111,7 @@ class OnionRouter:
         :return: The URL to the onion router's descriptor (where keys are stored).
         :rtype: str
         """
-        return "http://%s:%s/tor/server/fp/%s" % (self.ip, self.dir_port, self.fingerprint)
+        return "http://%s:%s/tor/server/fp/%s" % (self.ip, self.dir_port, self.identity)
 
     def parse_descriptor(self):
         """Updates the onion router's keys, may raise HTTPError."""
@@ -130,11 +130,11 @@ class OnionRouter:
 
     def set_shared_secret(self, data):
         """
-        When used in the ntor handshake, the first HASH_LEN bytes form the
+        When used in the NTOR handshake, the first HASH_LEN bytes form the
         forward digest Df; the next HASH_LEN form the backward digest Db; the
         next KEY_LEN form Kf, the next KEY_LEN form Kb, and the final
         DIGEST_LEN bytes are taken as a nonce to use in the place of KH in the
-        hidden service protocol.  Excess bytes from K are discarded.
+        hidden service protocol. Excess bytes from K are discarded.
 
         :type data: bytes
         """
@@ -145,32 +145,25 @@ class OnionRouter:
         self.encryption_key = encryption_key
         self.decryption_key = decryption_key
 
-    def encrypt(self, payload):
-        """Encrypts the payload with our stream cipher.
+    def get_digest(self, data):
+        digest = sha1()
+        digest.update(self.forward_digest)
+        digest.update(data)
+        return digest.digest()
 
-        :type payload: bytes
-        """
-        encryption_key = hexlify(self.encryption_key).decode()
-        command = "echo '%s' | openssl enc -aes-128-ctr -e -base64 -A -K %s -iv 0 2>/dev/null | base64 -d" % \
-                  (b64encode(payload).decode(), encryption_key)
-        out, err = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-        # TODO - Native base64 -d
-
-        log.debug("Output: " + str(out + err))
-
-        return out + err
+    def encrypt(self, relay_payload):
+        cipher = Cipher(AES(self.encryption_key), CTR(b'\x00' * 16), backend=default_backend()).encryptor()
+        return cipher.update(relay_payload)
 
 
 class Consensus:
     """
     Hardcoded into each Tor client is the information about 10 beefy Tor nodes run by trusted volunteers.
     These nodes have a very special role - to maintain the status of the entire Tor network.
-    These nodes are known as directory authorities (DA’s).
+    These nodes are known as directory authorities (DA's).
 
     The status of all the Tor relays is maintained in a living document called the consensus.
-    DA’s maintain this document and update it every hour by a vote.
-
-    See https://jordan-wright.com/blog/2015/05/14/how-tor-works-part-three-the-consensus/
+    DA's maintain this document and update it every hour by a vote.
     """
 
     def __init__(self):
@@ -312,7 +305,6 @@ class CommandType:
     # RELAY packets to tunnel end-to-end commands and TCP connections
     # ("Streams") across circuits. End-to-end commands can be initiated
     # by either edge; streams are initiated by the OP.
-    #
     RELAY_BEGIN = 1
     RELAY_DATA = 2
     RELAY_END = 3
@@ -605,7 +597,7 @@ class KeyAgreementNTOR:
         #     NODE_ID     Server identity digest  [ID_LENGTH bytes]
         #     KEYID       KEYID(B)                [H_LENGTH bytes]
         #     CLIENT_PK   X                       [G_LENGTH bytes]
-        self._handshake = b16decode(self._onion_router.fingerprint.encode())
+        self._handshake = b16decode(self._onion_router.identity.encode())
         self._handshake += self._B
         self._handshake += self._X
 
@@ -658,7 +650,7 @@ class KeyAgreementNTOR:
         # secret_input = EXP(Y,x) | EXP(B,x) | ID | B | X | Y | PROTOID
         secret_input = self._ed25519.smult_curve25519(self._x, Y)
         secret_input += self._ed25519.smult_curve25519(self._x, self._B)
-        secret_input += b16decode(self._onion_router.fingerprint.encode())
+        secret_input += b16decode(self._onion_router.identity.encode())
         secret_input += self._B
         secret_input += self._X
         secret_input += Y
@@ -670,7 +662,7 @@ class KeyAgreementNTOR:
 
         # auth_input = verify | ID | B | Y | X | PROTOID | "Server"
         auth_input = verify
-        auth_input += b16decode(self._onion_router.fingerprint.encode())
+        auth_input += b16decode(self._onion_router.identity.encode())
         auth_input += self._B
         auth_input += Y
         auth_input += self._X
@@ -738,18 +730,11 @@ class Circuit:
         self._onion_routers.append(guard_relay)
 
     def extend(self, onion_router):
-        """
-        To extend the circuit by a single onion router R_M, the OP performs these steps:
-            1. Create an onion skin, encrypted to R_M's public onion key.
-            2. Send the onion skin in a relay EXTEND2 cell along
-               the circuit (see sections 5.1.2 and 5.5).
-            3. When a relay EXTENDED/EXTENDED2 cell is received, verify KH,
-               and calculate the shared keys.  The circuit is now extended.
+        """Extends the circuit to the specified onion router.
 
         :type onion_router: OnionRouter
-        :type digest: bytes
         """
-        log.debug("Extending the circuit...")
+        log.debug("Extending the circuit to \"%s\"...", onion_router.nickname)
 
         onion_skin = KeyAgreementNTOR(onion_router).get_onion_skin()
 
@@ -765,12 +750,10 @@ class Circuit:
         #     HTYPE      (Client Handshake Type)         [2 bytes]
         #     HLEN       (Client Handshake Data Len)     [2 bytes]
         #     HDATA      (Client Handshake Data)         [HLEN bytes]
-        log.debug("Creating EXTEND2 payload...")
-
-        data = struct.pack("!B", 2)
-        data += struct.pack("!BB4sH", 0, 6, socket.inet_aton(onion_router.ip), onion_router.tor_port)
-        data += struct.pack("!BB20s", 2, 20, b16decode(onion_router.fingerprint.encode()))
-        data += struct.pack("!HH", 2, len(onion_skin)) + onion_skin
+        relay_payload = struct.pack("!B", 2)
+        relay_payload += struct.pack("!BB4sH", 0, 6, socket.inet_aton(onion_router.ip), onion_router.tor_port)
+        relay_payload += struct.pack("!BB20s", 2, 20, b16decode(onion_router.identity.encode()))
+        relay_payload += struct.pack("!HH", 2, len(onion_skin)) + onion_skin
 
         # The payload of each unencrypted RELAY cell consists of:
         #       Relay command           [1 byte]
@@ -779,45 +762,28 @@ class Circuit:
         #       Digest                  [4 bytes]
         #       Length                  [2 bytes]
         #       Data                    [PAYLOAD_LEN-11 bytes]
-        log.debug("Creating relay payload...")
+        relay_cell = struct.pack("!B", CommandType.RELAY_EXTEND2)
+        relay_cell += struct.pack("!H", 0)
+        relay_cell += struct.pack("!H", 0)
+        relay_cell += struct.pack("!4s", b"\x00" * 4)
+        relay_cell += struct.pack("!H", len(relay_payload))
+        relay_cell += struct.pack("!498s", relay_payload)
 
-        relay_payload = struct.pack("!B", CommandType.RELAY_EXTEND2)
-        relay_payload += struct.pack("!H", 0)
-        relay_payload += struct.pack("!H", 1)
-        relay_payload += struct.pack("!4s", ("\x00" * 4).encode())  # Digest placeholder.
-        relay_payload += struct.pack("!H", len(data))
-        relay_payload += struct.pack("!498s", data)
+        # Calculate and replace the digest.
+        # TODO - Once it's working with the guard relay:
+        # TODO - Swap this out with the end onion router (the digest).
+        calculated_digest = self.get_tor_socket().get_guard_relay().get_digest(relay_cell)[:4]
+        relay_cell = relay_cell[:5] + calculated_digest + relay_cell[9:]
 
-        # Calculate and update the digest.
-        log.debug("Calculating digest...")
-        guard_relay = self.get_onion_routers()[0]
+        # Encrypt the relay cell to the last onion router in the circuit.
+        encrypted_cell = self.get_tor_socket().get_guard_relay().encrypt(relay_cell)
 
-        calculated_digest = sha1()
-        calculated_digest.update(guard_relay.forward_digest)
-        calculated_digest.update(relay_payload)
-        calculated_digest = calculated_digest.digest()[:4]
+        # When speaking v2 of the link protocol or later, clients MUST only send
+        # EXTEND2 cells inside RELAY_EARLY cells.
+        relay_early_cell = Cell(self.get_circuit_id(), CommandType.RELAY_EARLY, {"encrypted_payload": encrypted_cell})
 
-        relay_payload = relay_payload[:5] + struct.pack("!4s", calculated_digest) + relay_payload[9:]
-
-        # When a relay cell is sent from an OP, the OP encrypts the payload
-        # with the stream cipher as follows:
-        #    OP sends relay cell:
-        #       For I=N...1, where N is the destination node:
-        #          Encrypt with Kf_I.
-        #       Transmit the encrypted cell to node 1.
-        #
-        # tor-spec.txt 5.5.2.1. "Routing from the Origin"
-        log.debug("Encrypting relay payload...")
-
-        relay_payload = guard_relay.encrypt(relay_payload)
-
-        log.debug("Encrypted output: " + str(relay_payload))
-        whatever_cell = Cell(self.get_circuit_id(), CommandType.RELAY_EARLY, {"encrypted_payload": relay_payload})
-
-        log.debug("Sending cell...")
-        self._tor_socket.send_cell(whatever_cell)
-        log.debug("Getting response...")
-        self._tor_socket.retrieve_cell()
+        self.get_tor_socket().send_cell(relay_early_cell)
+        self.get_tor_socket().retrieve_cell()
 
 
 class TorSocket:
@@ -935,13 +901,13 @@ class TorSocket:
                 auth = data[32:]
 
                 return Cell(circuit_id, command, {"Y": y, "auth": auth})
-            elif command == CommandType.DESTROY or CommandType.RELAY_TRUNCATE:
-                # The payload of a RELAY_TRUNCATED or DESTROY cell contains a single octet,
-                # describing why the circuit is being closed or truncated.
-                reason = struct.unpack("!B", payload[:1])[0]
-
-                log.warning("Circuit %s destroyed, reason: %s" % (str(circuit_id), str(reason)))
-                return Cell(circuit_id, command, {"reason": reason})
+            # elif command == CommandType.DESTROY or CommandType.RELAY_TRUNCATE:
+            #     # The payload of a RELAY_TRUNCATED or DESTROY cell contains a single octet,
+            #     # describing why the circuit is being closed or truncated.
+            #     reason = struct.unpack("!B", payload[:1])[0]
+            #
+            #     log.warning("Circuit %s destroyed, reason: %s" % (str(circuit_id), str(reason)))
+            #     return Cell(circuit_id, command, {"reason": reason})
             else:
                 log.debug("===== START UNKNOWN CELL =====")
                 log.debug("Circuit ID: " + str(circuit_id))
@@ -1068,21 +1034,12 @@ class TinyTor:
         circuit = Circuit(tor_socket)
         circuit.create(guard_relay)
 
-        # Extend the circuit.
-        while len(circuit.get_onion_routers()) < 3:
-            try:
-                onion_router = self._consensus.get_random_onion_router()
+        log.debug("Extending the circuit...")
 
-                log.debug("Using onion router \"%s\"..." % onion_router.nickname)
-                log.debug("Descriptor URL: %s" % onion_router.get_descriptor_url())
-                log.debug("Parsing the guard relays keys...")
+        extend_relay = self._consensus.get_random_onion_router()
+        extend_relay.parse_descriptor()
 
-                onion_router.parse_descriptor()
-                circuit.extend(onion_router)
-                break
-            except HTTPError:
-                traceback.print_exc()
-                log.info("Retrying with a different onion router...")
+        circuit.extend(extend_relay)
 
         return "TINYTOR_IMPLEMENTATION_IS_NOT_FINISHED"
 
