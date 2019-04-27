@@ -155,6 +155,10 @@ class OnionRouter:
         cipher = Cipher(AES(self.encryption_key), CTR(b'\x00' * 16), backend=default_backend()).encryptor()
         return cipher.update(relay_payload)
 
+    def decrypt(self, relay_payload):
+        cipher = Cipher(AES(self.decryption_key), CTR(b'\x00' * 16), backend=default_backend()).decryptor()
+        return cipher.update(relay_payload)
+
 
 class Consensus:
     """
@@ -437,6 +441,62 @@ class Cell:
             return False
 
 
+class RelayCell(Cell):
+
+    def __init__(self, cell):
+        super().__init__(cell.circuit_id, cell.command, cell.payload["encrypted_payload"])
+
+    def decrypt(self, onion_routers):
+        """Decrypts the encrypted payload.
+
+        :type onion_routers: list[OnionRouter]
+        """
+        for router in reversed(onion_routers):
+            self.payload = router.decrypt(self.payload)
+
+    def parse_cell(self):
+        """Parses the relay cell.
+
+        :rtype: dict
+        """
+        # The payload of each unencrypted RELAY cell consists of:
+        #       Relay command           [1 byte]
+        #       'Recognized'            [2 bytes]
+        #       StreamID                [2 bytes]
+        #       Digest                  [4 bytes]
+        #       Length                  [2 bytes]
+        #       Data                    [PAYLOAD_LEN-11 bytes]
+        relay_command = struct.unpack("!B", self.payload[:1])[0]
+        recognized = struct.unpack("!H", self.payload[1:][:2])[0]
+        stream_id = struct.unpack("!H", self.payload[3:][:2])[0]
+        digest = struct.unpack("!4s", self.payload[5:][:4])[0]
+        length = struct.unpack("!H", self.payload[9:][:2])[0]
+        data = struct.unpack("!498s", self.payload[11:])[0]
+
+        response_data = {
+            "command": relay_command,
+            "recognized": recognized,
+            "stream_id": stream_id,
+            "digest": digest,
+            "length": length,
+            "data": data
+        }
+
+        if relay_command == CommandType.RELAY_EXTENDED2:
+            data_length = struct.unpack("!H", data[:2])[0]
+            data = data[2:data_length + 2]
+            y = data[:32]
+            auth = data[32:]
+
+            response_data["Y"] = y
+            response_data["auth"] = auth
+        else:
+            log.warning("Unsupported relay cell: %d", relay_command)
+            return response_data
+
+        return response_data
+
+
 class Ed25519:
     """
     Python implementation of Ed25519, used by the NTOR handshake.
@@ -713,7 +773,7 @@ class Circuit:
 
         tor-spec.txt 5.1. "CREATE and CREATED cells"
         """
-        log.debug("Performing handshake...")
+        log.debug("Creating new circuit...")
         key_agreement = KeyAgreementNTOR(guard_relay)
 
         self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, {
@@ -722,9 +782,7 @@ class Circuit:
             "data": key_agreement.get_onion_skin()
         }))
 
-        log.debug("Waiting for response...")
         cell = self._tor_socket.retrieve_cell()
-        log.debug("Verifying response...")
 
         key_agreement.complete_handshake(cell.payload["Y"], cell.payload["auth"])
         self._onion_routers.append(guard_relay)
@@ -736,7 +794,7 @@ class Circuit:
         """
         log.debug("Extending the circuit to \"%s\"...", onion_router.nickname)
 
-        onion_skin = KeyAgreementNTOR(onion_router).get_onion_skin()
+        key_agreement = KeyAgreementNTOR(onion_router)
 
         # To extend an existing circuit, the client sends an EXTEND2
         # relay cell to the last node in the circuit.
@@ -753,7 +811,7 @@ class Circuit:
         relay_payload = struct.pack("!B", 2)
         relay_payload += struct.pack("!BB4sH", 0, 6, socket.inet_aton(onion_router.ip), onion_router.tor_port)
         relay_payload += struct.pack("!BB20s", 2, 20, b16decode(onion_router.identity.encode()))
-        relay_payload += struct.pack("!HH", 2, len(onion_skin)) + onion_skin
+        relay_payload += struct.pack("!HH", 2, len(key_agreement.get_onion_skin())) + key_agreement.get_onion_skin()
 
         # The payload of each unencrypted RELAY cell consists of:
         #       Relay command           [1 byte]
@@ -770,20 +828,28 @@ class Circuit:
         relay_cell += struct.pack("!498s", relay_payload)
 
         # Calculate and replace the digest.
-        # TODO - Once it's working with the guard relay:
-        # TODO - Swap this out with the end onion router (the digest).
-        calculated_digest = self.get_tor_socket().get_guard_relay().get_digest(relay_cell)[:4]
+        calculated_digest = self.get_onion_routers()[-1].get_digest(relay_cell)[:4]
         relay_cell = relay_cell[:5] + calculated_digest + relay_cell[9:]
 
         # Encrypt the relay cell to the last onion router in the circuit.
-        encrypted_cell = self.get_tor_socket().get_guard_relay().encrypt(relay_cell)
+        for router in reversed(self.get_onion_routers()):
+            relay_cell = router.encrypt(relay_cell)
 
         # When speaking v2 of the link protocol or later, clients MUST only send
         # EXTEND2 cells inside RELAY_EARLY cells.
-        relay_early_cell = Cell(self.get_circuit_id(), CommandType.RELAY_EARLY, {"encrypted_payload": encrypted_cell})
+        self.get_tor_socket().send_cell(Cell(
+            self.get_circuit_id(),
+            CommandType.RELAY_EARLY,
+            {"encrypted_payload": relay_cell})
+        )
 
-        self.get_tor_socket().send_cell(relay_early_cell)
-        self.get_tor_socket().retrieve_cell()
+        response_cell = RelayCell(self.get_tor_socket().retrieve_cell())
+        response_cell.decrypt(self.get_onion_routers())
+
+        parsed_response = response_cell.parse_cell()
+
+        key_agreement.complete_handshake(parsed_response["Y"], parsed_response["auth"])
+        self._onion_routers.append(onion_router)
 
 
 class TorSocket:
@@ -841,8 +907,11 @@ class TorSocket:
         self._socket.write(cell.get_bytes(self.get_max_protocol_version()))
 
     def retrieve_cell(self, ignore_response=False):
-        """Waits for a cell response then parses it into a Cell object.
+        """
+        Waits for a cell response then parses it into a Cell object.
+        Relay cells should be passed onto a RelayCell for decryption and parsing.
 
+        :type ignore_response: True if the response should NOT be parsed.
         :rtype: Cell or None
         """
         # https://docs.python.org/3/library/struct.html
@@ -889,31 +958,32 @@ class TorSocket:
                 our_address = socket.inet_ntoa(payload[6:][:our_address_length])
 
                 return Cell(circuit_id, command, {"our_address": our_address})
-            elif command == CommandType.CREATED2 or command == CommandType.RELAY_EXTENDED2:
+            elif command == CommandType.CREATED2:
                 # A CREATED2 cell contains:
                 #     DATA_LEN      (Server Handshake Data Len) [2 bytes]
                 #     DATA          (Server Handshake Data)     [DATA_LEN bytes]
-                #
-                # The payload of an EXTENDED2 cell is the same as the payload of a CREATED2 cell.
                 data_length = struct.unpack("!H", payload[:2])[0]
                 data = payload[2:data_length + 2]
                 y = data[:32]
                 auth = data[32:]
 
                 return Cell(circuit_id, command, {"Y": y, "auth": auth})
-            # elif command == CommandType.DESTROY or CommandType.RELAY_TRUNCATE:
-            #     # The payload of a RELAY_TRUNCATED or DESTROY cell contains a single octet,
-            #     # describing why the circuit is being closed or truncated.
-            #     reason = struct.unpack("!B", payload[:1])[0]
-            #
-            #     log.warning("Circuit %s destroyed, reason: %s" % (str(circuit_id), str(reason)))
-            #     return Cell(circuit_id, command, {"reason": reason})
+            elif command == CommandType.RELAY:
+                # The relay commands, should be passed to a relay cell for decryption.
+                return Cell(circuit_id, command, {"encrypted_payload": payload})
+            elif command == CommandType.DESTROY or command == CommandType.RELAY_TRUNCATE:
+                # The payload of a RELAY_TRUNCATED or DESTROY cell contains a single octet,
+                # describing why the circuit is being closed or truncated.
+                reason = struct.unpack("!B", payload[:1])[0]
+
+                log.warning("Circuit %s destroyed, reason: %s" % (str(circuit_id), str(reason)))
+                return Cell(circuit_id, command, {"reason": reason})
             else:
-                log.debug("===== START UNKNOWN CELL =====")
+                log.debug("-*-*-*-*-*- UNKNOWN_CELL -*-*-*-*-*-")
                 log.debug("Circuit ID: " + str(circuit_id))
                 log.debug("Command type: " + str(command))
                 log.debug("Payload: " + str(payload))
-                log.debug("===== END UNKNOWN CELL   =====")
+                log.debug("-*-*-*-*-*- UNKNOWN_CELL -*-*-*-*-*-")
                 return Cell(circuit_id, command, {"payload": payload})
 
     def _send_versions(self):
@@ -1034,12 +1104,13 @@ class TinyTor:
         circuit = Circuit(tor_socket)
         circuit.create(guard_relay)
 
-        log.debug("Extending the circuit...")
-
         extend_relay = self._consensus.get_random_onion_router()
         extend_relay.parse_descriptor()
-
         circuit.extend(extend_relay)
+
+        # extend_relay2 = self._consensus.get_random_onion_router()
+        # extend_relay2.parse_descriptor()
+        # circuit.extend(extend_relay2)
 
         return "TINYTOR_IMPLEMENTATION_IS_NOT_FINISHED"
 
