@@ -126,6 +126,9 @@ class OnionRouter:
 
             if line.startswith("ntor-onion-key "):
                 self.key_ntor = line.split("ntor-onion-key")[1].strip()
+                if self.key_ntor[-1] != '=':
+                    # The trailing '=' sign MAY be omitted from the base64 encoding
+                    self.key_ntor += "="
                 break
 
     def set_shared_secret(self, data):
