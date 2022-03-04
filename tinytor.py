@@ -101,8 +101,8 @@ class OnionRouter:
         self.flags = None
         self.key_ntor = None
 
-        self.forward_digest = None
-        self.backward_digest = None
+        self._forward_digest = None
+        self._backward_digest = None
         self.encryption_key = None
         self.decryption_key = None
 
@@ -143,24 +143,32 @@ class OnionRouter:
         """
         forward_digest, backward_digest, encryption_key, decryption_key = struct.unpack("!20s20s16s16s", data)
 
-        self.forward_digest = forward_digest
-        self.backward_digest = backward_digest
+        self._forward_digest = self.set_digest(forward_digest)
+        self._backward_digest = self.set_digest(backward_digest)
         self.encryption_key = encryption_key
         self.decryption_key = decryption_key
+        self._forward_cipher = Cipher(AES(self.encryption_key), CTR(b'\0' * 16), backend=default_backend()).encryptor()
+        self._backward_cipher = Cipher(AES(self.decryption_key), CTR(b'\0' * 16), backend=default_backend()).decryptor()
 
-    def get_digest(self, data):
+    def set_digest(self, data):
         digest = sha1()
-        digest.update(self.forward_digest)
         digest.update(data)
-        return digest.digest()
+        return digest
+
+    def get_forward_digest(self, data):
+        self._forward_digest.update(data)
+        return self._forward_digest.digest()
+
+    def get_backward_digest(self, data):
+        data = data[:5] + struct.pack("!4s", b"\x00" * 4) + data[9:]
+        self._backward_digest.update(data)
+        return self._backward_digest.digest()
 
     def encrypt(self, relay_payload):
-        cipher = Cipher(AES(self.encryption_key), CTR(b'\x00' * 16), backend=default_backend()).encryptor()
-        return cipher.update(relay_payload)
+        return self._forward_cipher.update(relay_payload)
 
     def decrypt(self, relay_payload):
-        cipher = Cipher(AES(self.decryption_key), CTR(b'\x00' * 16), backend=default_backend()).decryptor()
-        return cipher.update(relay_payload)
+        return self._backward_cipher.update(relay_payload)
 
 
 class Consensus:
@@ -853,6 +861,29 @@ class Circuit:
 
         key_agreement.complete_handshake(parsed_response["Y"], parsed_response["auth"])
         self._onion_routers.append(onion_router)
+
+    def encrypt_payload(self, relay_payload):
+        """Encrypts the relay payload.
+
+        :rtype relay_payload: bytes
+        """
+        for router in reversed(self.get_onion_routers()):
+            relay_payload = router.encrypt(relay_payload)
+        return relay_payload
+
+    def decrypt_payload(self, relay_payload):
+        """Decrypts the encrypted payload.
+
+        :rtype relay_payload: bytes
+        """
+        for router in self.get_onion_routers():
+            relay_payload = router.decrypt(relay_payload)
+            # if 'recognized' = ZERO then probability is high that the relay cell was decrypted
+            if relay_payload[1:3] == (b"\x00" * 2):
+                digest = router.get_backward_digest(relay_payload)[:4]
+                # check that also the digest is correct
+                if relay_payload[5:9] == digest:
+                    return relay_payload
 
 
 class TorSocket:
