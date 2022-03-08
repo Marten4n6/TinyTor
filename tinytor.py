@@ -286,6 +286,19 @@ class Consensus:
         """
         return random.choice(self._parsed_consensus)
 
+    def get_random_exit_router(self):
+        """
+        :return: A random exit router.
+        :rtype: OnionRouter
+        """
+        exit_relays = []
+
+        for onion_router in self._parsed_consensus:
+            if "exit" in onion_router.flags:
+                exit_relays.append(onion_router)
+
+        return random.choice(exit_relays)
+
 
 class CommandType:
     """Enum class which contains all available command types.
@@ -506,7 +519,6 @@ class RelayCell(Cell):
             pass
         else:
             log.warning("Unsupported relay cell: %d", relay_command)
-            return response_data
 
         return response_data
 
@@ -760,8 +772,12 @@ class Circuit:
         :type tor_socket: TorSocket
         """
         self._tor_socket = tor_socket
-        self._circuit_id = random.randint(2 ** 31, (2 ** 32) - 1)  # C int value range (4 bytes)
-        self._onion_routers = []
+        if self._tor_socket.get_max_protocol_version() < 4:
+            self._circuit_id = random.randint(0, (2 ** 16) - 1)  # C int value range (2 bytes)
+        else:
+            self._circuit_id = random.randint(2 ** 31, (2 ** 32) - 1)  # C int value range (4 bytes)
+        self._onion_routers = list()
+        self._stream_id = 0
 
     def get_tor_socket(self):
         """:rtype: TorSocket"""
@@ -788,6 +804,7 @@ class Circuit:
         tor-spec.txt 5.1. "CREATE and CREATED cells"
         """
         log.debug("Creating new circuit...")
+        log.debug("Circuit ID:" + str(self._circuit_id))
         key_agreement = KeyAgreementNTOR(guard_relay)
 
         self._tor_socket.send_cell(Cell(self.get_circuit_id(), CommandType.CREATE2, {
@@ -797,6 +814,9 @@ class Circuit:
         }))
 
         cell = self._tor_socket.retrieve_cell()
+        if cell.command != CommandType.CREATED2:
+            log.error("Received command is not a CREATED2.")
+            raise Exception("Received command is not a CREATED2.")
 
         key_agreement.complete_handshake(cell.payload["Y"], cell.payload["auth"])
         self._onion_routers.append(guard_relay)
@@ -973,12 +993,16 @@ class TorSocket:
         #    CircuitID                           [CIRCUIT_ID_LEN bytes]
         #    Command                             [1 byte]
         #    Payload (padded with padding bytes) [PAYLOAD_LEN bytes]
+        payload = b''
         if Cell.is_variable_length_command(command):
             payload_length = struct.unpack("!H", self._socket.read(2))[0]
             payload = self._socket.read(payload_length)
         else:
-            payload = self._socket.read(Cell.MAX_PAYLOAD_SIZE)
+            while len(payload) != Cell.MAX_PAYLOAD_SIZE:
+                payload += self._socket.read(Cell.MAX_PAYLOAD_SIZE - len(payload))
 
+        if command in (CommandType.PADDING, CommandType.VPADDING):
+            return self.retrieve_cell()
         # Parse into a cell object here...
         if not ignore_response:
             if command == CommandType.VERSIONS:
@@ -1008,7 +1032,7 @@ class TorSocket:
             elif command == CommandType.RELAY:
                 # The relay commands, should be passed to a relay cell for decryption.
                 return Cell(circuit_id, command, {"encrypted_payload": payload})
-            elif command == CommandType.DESTROY or command == CommandType.RELAY_TRUNCATE:
+            elif command == CommandType.DESTROY:
                 # The payload of a RELAY_TRUNCATED or DESTROY cell contains a single octet,
                 # describing why the circuit is being closed or truncated.
                 reason = struct.unpack("!B", payload[:1])[0]
