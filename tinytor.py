@@ -471,14 +471,6 @@ class RelayCell(Cell):
     def __init__(self, cell):
         super().__init__(cell.circuit_id, cell.command, cell.payload["encrypted_payload"])
 
-    def decrypt(self, onion_routers):
-        """Decrypts the encrypted payload.
-
-        :type onion_routers: list[OnionRouter]
-        """
-        for router in reversed(onion_routers):
-            self.payload = router.decrypt(self.payload)
-
     def parse_cell(self):
         """Parses the relay cell.
 
