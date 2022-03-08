@@ -314,6 +314,7 @@ class CommandType:
     AUTH_CHALLENGE = 130
     AUTHENTICATE = 131
 
+class RelayCommand:
     # The relay commands.
     #
     # Within a circuit, the OP and the exit node use the contents of
@@ -410,7 +411,7 @@ class Cell:
             #     H_LEN      (Client Handshake Data Len) [2 bytes]
             #     H_DATA     (Client Handshake Data)     [H_LEN bytes]
             payload_bytes = struct.pack("!HH", self.payload["type"], self.payload["length"]) + self.payload["data"]
-        elif self.command == CommandType.RELAY_EARLY:
+        elif self.command in (CommandType.RELAY_EARLY, CommandType.RELAY):
             payload_bytes = self.payload["encrypted_payload"]
         else:
             log.error("Invalid payload format for command: " + str(self.command))
@@ -493,7 +494,7 @@ class RelayCell(Cell):
             "data": data
         }
 
-        if relay_command == CommandType.RELAY_EXTENDED2:
+        if relay_command == RelayCommand.RELAY_EXTENDED2:
             data_length = struct.unpack("!H", data[:2])[0]
             data = data[2:data_length + 2]
             y = data[:32]
@@ -501,6 +502,8 @@ class RelayCell(Cell):
 
             response_data["Y"] = y
             response_data["auth"] = auth
+        elif relay_command in (RelayCommand.RELAY_DATA, RelayCommand.RELAY_CONNECTED, RelayCommand.RELAY_END):
+            pass
         else:
             log.warning("Unsupported relay cell: %d", relay_command)
             return response_data
