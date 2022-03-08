@@ -467,6 +467,7 @@ class Cell:
 
 
 class RelayCell(Cell):
+    MAX_RELAY_CELL_DATA = Cell.MAX_PAYLOAD_SIZE - 11
 
     def __init__(self, cell):
         super().__init__(cell.circuit_id, cell.command, cell.payload["encrypted_payload"])
@@ -840,7 +841,51 @@ class Circuit:
 
         # Encrypt the relay cell to the last onion router in the circuit.
         relay_cell = self.encrypt_payload(relay_cell)
-        return relay_cell    def extend(self, onion_router):
+        return relay_cell
+
+    def start_stream(self, address, port):
+        """Start a new stream to a specific tagret address.
+
+        :type address: str
+        :type port: int
+        """
+        self._stream_id += 1
+        log.debug("Starting a stream with stream id: " + str(self._stream_id))
+        # The payload format is:
+        # ADDRPORT[nul - terminated string]
+        # FLAGS[4 bytes]
+        # ADDRPORT is made of ADDRESS | ':' | PORT | [00]
+        relay_payload = '{}:{}'.format(address, port).encode()
+        relay_payload += struct.pack('!BI', 0, 0)
+        relay_cell = self.create_relay_cell(RelayCommand.RELAY_BEGIN, self._stream_id, relay_payload)
+        self.get_tor_socket().send_cell(Cell(
+            self.get_circuit_id(),
+            CommandType.RELAY,
+            {"encrypted_payload": relay_cell})
+        )
+        response_cell = RelayCell(self.get_tor_socket().retrieve_cell())
+        response_cell.payload = self.decrypt_payload(response_cell.payload)
+        parsed_response = response_cell.parse_cell()
+        if parsed_response['command'] != RelayCommand.RELAY_CONNECTED:
+            log.error("Creating a connection to the address failed.")
+            raise Exception("Creating a connection to the address failed.")
+
+    def send_http_get(self):
+        """Sends a HTTP GET request out to an address.
+
+        :return: response received from the address
+        """
+        relay_payload = b'GET / HTTP/1.0\r\n\r\n'
+        relay_cell = self.create_relay_cell(RelayCommand.RELAY_DATA, self._stream_id, relay_payload)
+        self.get_tor_socket().send_cell(Cell(
+            self.get_circuit_id(),
+            CommandType.RELAY,
+            {"encrypted_payload": relay_cell})
+        )
+        response_data = self.get_tor_socket().retrieve_relay_data(self)
+        return response_data
+
+    def extend(self, onion_router):
         """Extends the circuit to the specified onion router.
 
         :type onion_router: OnionRouter
@@ -877,8 +922,10 @@ class Circuit:
         )
 
         response_cell = RelayCell(self.get_tor_socket().retrieve_cell())
-        response_cell.decrypt(self.get_onion_routers())
-
+        if response_cell.command != CommandType.RELAY:
+            log.error("Received command is not a RELAY.")
+            raise Exception("Received command is not a RELAY.")
+        response_cell.payload = self.decrypt_payload(response_cell.payload)
         parsed_response = response_cell.parse_cell()
 
         key_agreement.complete_handshake(parsed_response["Y"], parsed_response["auth"])
@@ -1084,6 +1131,20 @@ class TorSocket:
         self._our_public_ip = cell.payload["our_address"]
         log.debug("Our public IP address: " + self._our_public_ip)
 
+    def retrieve_relay_data(self, circuit):
+        log.debug("Retrieving RELAY_DATA cells...")
+        response = b''
+        while True:
+            cell = RelayCell(self.retrieve_cell())
+            if cell.command == CommandType.RELAY:
+                cell.payload = circuit.decrypt_payload(cell.payload)
+                parsed_response = cell.parse_cell()
+                if parsed_response['command'] == RelayCommand.RELAY_DATA:
+                    data_length = parsed_response['length']
+                    response += parsed_response['data'][:data_length]
+                    if data_length < RelayCell.MAX_RELAY_CELL_DATA:
+                        return response
+
     def _send_net_info(self):
         """
         If version 2 or higher is negotiated, each party sends the other a NETINFO cell.
@@ -1164,15 +1225,24 @@ class TinyTor:
         circuit = Circuit(tor_socket)
         circuit.create(guard_relay)
 
-        extend_relay = self._consensus.get_random_onion_router()
+        while True:
+            extend_relay = self._consensus.get_random_onion_router()
+            if extend_relay.identity not in [router.identity for router in circuit.get_onion_routers()]:
+                break
         extend_relay.parse_descriptor()
         circuit.extend(extend_relay)
 
-        # extend_relay2 = self._consensus.get_random_onion_router()
-        # extend_relay2.parse_descriptor()
-        # circuit.extend(extend_relay2)
+        while True:
+            extend_relay2 = self._consensus.get_random_exit_router()
+            if extend_relay2.identity not in [router.identity for router in circuit.get_onion_routers()]:
+                break
+        extend_relay2.parse_descriptor()
+        circuit.extend(extend_relay2)
 
-        return "TINYTOR_IMPLEMENTATION_IS_NOT_FINISHED"
+        circuit.start_stream(url, 80)
+        response = circuit.send_http_get()
+
+        return response
 
 
 def main():
@@ -1192,7 +1262,7 @@ def main():
         log.setLevel(logging.DEBUG)
 
     tor = TinyTor()
-    log.info("Received response: \n%s" % tor.http_get(arguments.host))
+    print("Received response: \n%s" % tor.http_get(arguments.host))
 
 
 if __name__ == '__main__':
