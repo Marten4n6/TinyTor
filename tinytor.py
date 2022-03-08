@@ -813,7 +813,34 @@ class Circuit:
         key_agreement.complete_handshake(cell.payload["Y"], cell.payload["auth"])
         self._onion_routers.append(guard_relay)
 
-    def extend(self, onion_router):
+    def create_relay_cell(self, command, stream_id, payload):
+        """Creates a encrypted bytes stream that contains the relay payload.
+
+        :rtype: bytes
+        """
+        # The payload of each unencrypted RELAY cell consists of:
+        #       Relay command           [1 byte]
+        #       'Recognized'            [2 bytes]
+        #       StreamID                [2 bytes]
+        #       Digest                  [4 bytes]
+        #       Length                  [2 bytes]
+        #       Data                    [PAYLOAD_LEN-11 bytes]
+        relay_cell = struct.pack("!B", command)
+        relay_cell += struct.pack("!H", 0)
+        # Rather, RELAY cells that affect the
+        # entire circuit rather than a particular stream use a StreamID of zero
+        relay_cell += struct.pack("!H", stream_id)
+        relay_cell += struct.pack("!4s", b"\x00" * 4)
+        relay_cell += struct.pack("!H", len(payload))
+        relay_cell += struct.pack("!498s", payload)
+
+        # Calculate and replace the digest.
+        calculated_digest = self.get_onion_routers()[-1].get_forward_digest(relay_cell)[:4]
+        relay_cell = relay_cell[:5] + calculated_digest + relay_cell[9:]
+
+        # Encrypt the relay cell to the last onion router in the circuit.
+        relay_cell = self.encrypt_payload(relay_cell)
+        return relay_cell    def extend(self, onion_router):
         """Extends the circuit to the specified onion router.
 
         :type onion_router: OnionRouter
@@ -839,27 +866,7 @@ class Circuit:
         relay_payload += struct.pack("!BB20s", 2, 20, b16decode(onion_router.identity.encode()))
         relay_payload += struct.pack("!HH", 2, len(key_agreement.get_onion_skin())) + key_agreement.get_onion_skin()
 
-        # The payload of each unencrypted RELAY cell consists of:
-        #       Relay command           [1 byte]
-        #       'Recognized'            [2 bytes]
-        #       StreamID                [2 bytes]
-        #       Digest                  [4 bytes]
-        #       Length                  [2 bytes]
-        #       Data                    [PAYLOAD_LEN-11 bytes]
-        relay_cell = struct.pack("!B", CommandType.RELAY_EXTEND2)
-        relay_cell += struct.pack("!H", 0)
-        relay_cell += struct.pack("!H", 0)
-        relay_cell += struct.pack("!4s", b"\x00" * 4)
-        relay_cell += struct.pack("!H", len(relay_payload))
-        relay_cell += struct.pack("!498s", relay_payload)
-
-        # Calculate and replace the digest.
-        calculated_digest = self.get_onion_routers()[-1].get_digest(relay_cell)[:4]
-        relay_cell = relay_cell[:5] + calculated_digest + relay_cell[9:]
-
-        # Encrypt the relay cell to the last onion router in the circuit.
-        for router in reversed(self.get_onion_routers()):
-            relay_cell = router.encrypt(relay_cell)
+        relay_cell = self.create_relay_cell(RelayCommand.RELAY_EXTEND2, 0, relay_payload)
 
         # When speaking v2 of the link protocol or later, clients MUST only send
         # EXTEND2 cells inside RELAY_EARLY cells.
