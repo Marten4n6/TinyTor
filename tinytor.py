@@ -31,6 +31,13 @@ try:
 except ImportError:
     # Python2 support.
     from urllib2 import Request, urlopen, HTTPError
+try:
+    # python3
+    from urllib.parse import urlparse
+except:
+    # python2
+    from urlparse import urlparse
+
 
 try:
     # Set up byte handling for python2.
@@ -1214,7 +1221,7 @@ class TinyTor:
 
                 guard_relay.parse_descriptor()
                 break
-            except HTTPError:
+            except Exception:
                 traceback.print_exc()
                 log.info("Retrying with a different guard relay...")
 
@@ -1247,22 +1254,31 @@ class TinyTor:
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--host", help="the onion service to reach", required=True)
+    #parser.add_argument("--host", help="the onion service to reach", required=True)
+    parser.add_argument("--host", help="the url to reach", required=True)
     parser.add_argument("--no-banner", help="prevent the TinyTor banner from being displayed", action="store_true")
     parser.add_argument("-v", "--verbose", help="enable verbose output", action="store_true")
 
     arguments = parser.parse_args()
 
+    parsed_host = urlparse(arguments.host).geturl()
     if not arguments.no_banner:
         print(BANNER)
-    if not arguments.host.endswith(".onion"):
-        log.error("Please specify a valid onion service (--host).")
+    # The onion services v2 and v3 implementations are needed for connections to .oinion-addresses.
+    # specs for hidden-services:
+    # https://gitweb.torproject.org/torspec.git/tree/rend-spec-v2.txt
+    # https://gitweb.torproject.org/torspec.git/tree/rend-spec-v3.txt
+    #if not arguments.host.endswith(".onion"):
+        #log.error("Please specify a valid onion service (--host).")
+        #exit(1)
+    if not parsed_host:
+        log.error("Please specify a valid url (--host).")
         exit(1)
     if arguments.verbose:
         log.setLevel(logging.DEBUG)
 
     tor = TinyTor()
-    print("Received response: \n%s" % tor.http_get(arguments.host))
+    print("Received response: \n%s" % tor.http_get(parsed_host))
 
 
 if __name__ == '__main__':
