@@ -57,14 +57,14 @@ except NameError:
     intlist2bytes = bytes
     int2byte = operator.methodcaller("to_bytes", 1, "big")
 
-BANNER = """\
+BANNER = f"""\
   _____  _               _____            
  |_   _|(_) _ __   _   _|_   _|___   _ __ 
    | |  | || '_ \ | | | | | | / _ \ | '__|
-   | |  | || | | || |_| | | || (_) || |    @%s (v%s)
+   | |  | || | | || |_| | | || (_) || |    @{__author__} (v{__version__})
    |_|  |_||_| |_| \__, | |_| \___/ |_|    GPLv3 licensed
                    |___/                  
-""" % (__author__, __version__)
+"""
 
 # Logging
 logging.basicConfig(format="[%(levelname)s] %(filename)s - %(message)s", level=logging.INFO)
@@ -85,7 +85,7 @@ class DirectoryAuthority:
         :return: The URL to directory authority's consensus.
         :rtype: str
         """
-        return "http://%s:%s/tor/status-vote/current/consensus" % (self.ip, self.dir_port)
+        return f"http://{self.ip}:{self.dir_port}/tor/status-vote/current/consensus"
 
 
 class OnionRouter:
@@ -118,7 +118,7 @@ class OnionRouter:
         :return: The URL to the onion router's descriptor (where keys are stored).
         :rtype: str
         """
-        return "http://%s:%s/tor/server/fp/%s" % (self.ip, self.dir_port, self.identity)
+        return f"http://{self.ip}:{self.dir_port}/tor/server/fp/{self.identity}"
 
     def parse_descriptor(self):
         """Updates the onion router's keys, may raise HTTPError."""
@@ -270,7 +270,7 @@ class Consensus:
                         self._parsed_consensus.append(onion_router)
 
             if onion_router_amount >= limit:
-                log.warning("Stopped after reading %s onion routers." % limit)
+                log.warning(f"Stopped after reading {limit} onion routers.")
                 break
 
     def get_random_guard_relay(self):
@@ -897,7 +897,7 @@ class Circuit:
 
         :type onion_router: OnionRouter
         """
-        log.debug("Extending the circuit to \"%s\"...", onion_router.nickname)
+        log.debug(f"Extending the circuit to \"{onion_router.nickname}\"...")
 
         key_agreement = KeyAgreementNTOR(onion_router)
 
@@ -1090,7 +1090,7 @@ class TorSocket:
                 # describing why the circuit is being closed or truncated.
                 reason = struct.unpack("!B", payload[:1])[0]
 
-                log.warning("Circuit %s destroyed, reason: %s" % (str(circuit_id), str(reason)))
+                log.warning(f"Circuit {circuit_id} destroyed, reason: {reason}")
                 return Cell(circuit_id, command, {"reason": reason})
             else:
                 log.debug("-*-*-*-*-*- UNKNOWN_CELL -*-*-*-*-*-")
@@ -1121,7 +1121,7 @@ class TorSocket:
         log.debug("Retrieving VERSIONS cell...")
         versions_cell = self.retrieve_cell()
 
-        log.debug("Supported link protocol versions: %s" % versions_cell.payload["versions"])
+        log.debug(f"Supported link protocol versions: {versions_cell.payload['versions']}")
         self._protocol_versions = versions_cell.payload["versions"]
 
     def _retrieve_certs(self):
@@ -1195,14 +1195,14 @@ class TinyTor:
                 directory_authority = self._consensus.get_random_directory_authority()
                 consensus_url = directory_authority.get_consensus_url()
 
-                log.debug("Using directory authority \"%s\"..." % directory_authority.name)
-                log.debug("Consensus URL: %s" % consensus_url)
+                log.debug(f"Using directory authority \"{directory_authority.name}\"...")
+                log.debug(f"Consensus URL: {consensus_url}")
                 log.debug("Parsing the consensus...")
 
                 self._consensus.parse_consensus(consensus_url)
                 break
             except Exception as ex:
-                log.error("Failed to parse the consensus: %s" % str(ex))
+                log.error(f"Failed to parse the consensus: {ex}")
                 log.error("Retrying with a different directory authority...")
 
     def http_get(self, url):
@@ -1215,8 +1215,8 @@ class TinyTor:
             try:
                 guard_relay = self._consensus.get_random_guard_relay()
 
-                log.debug("Using guard relay \"%s\"..." % guard_relay.nickname)
-                log.debug("Descriptor URL: %s" % guard_relay.get_descriptor_url())
+                log.debug(f"Using guard relay \"{guard_relay.nickname}\"...")
+                log.debug(f"Descriptor URL: {guard_relay.get_descriptor_url()}")
                 log.debug("Parsing the guard relays keys...")
 
                 guard_relay.parse_descriptor()
@@ -1278,7 +1278,7 @@ def main():
         log.setLevel(logging.DEBUG)
 
     tor = TinyTor()
-    print("Received response: \n%s" % tor.http_get(parsed_host))
+    print(f"Received response: \n{tor.http_get(parsed_host)}")
 
 
 if __name__ == '__main__':
