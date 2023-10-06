@@ -123,7 +123,7 @@ class OnionRouter:
     def parse_descriptor(self):
         """Updates the onion router's keys, may raise HTTPError."""
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 6.1; rv:60.0) Gecko/20100101 Firefox/60.0"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0"
         }
         request = Request(url=self.get_descriptor_url(), headers=headers)
         response = urlopen(request, timeout=8)
@@ -217,7 +217,7 @@ class Consensus:
         :type limit: int
         """
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 6.1; rv:60.0) Gecko/20100101 Firefox/60.0"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0"
         }
         request = Request(url=consensus_url, headers=headers)
         response = urlopen(request, timeout=8)
